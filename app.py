@@ -437,11 +437,16 @@ def assign_scores(rows):
             )
 
 
+
 # ============================================================
 # 8. HTTP SERVER
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
+
+    # --------------------------------------------------------
+    # 8A. STANDARD HTTP RESPONSE
+    # --------------------------------------------------------
 
     def respond(
         self,
@@ -449,10 +454,11 @@ class Handler(BaseHTTPRequestHandler):
         code=200,
         content_type="application/json",
     ):
+
         data = (
             body
             if isinstance(body, bytes)
-            else json.dumps(body).encode()
+            else json.dumps(body).encode("utf-8")
         )
 
         self.send_response(code)
@@ -473,68 +479,153 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         self.end_headers()
+
         self.wfile.write(data)
+
+    # --------------------------------------------------------
+    # 8B. GET REQUEST ROUTER
+    # --------------------------------------------------------
 
     def do_GET(self):
 
-        if self.path == "/":
-            html = (
+        from urllib.parse import urlsplit
+
+        path = urlsplit(self.path).path
+
+        # ====================================================
+        # HEALTH CHECK
+        # ====================================================
+
+        if path in ("/health", "/health/"):
+
+            return self.respond({
+                "status": "ok",
+                "service": "crescendo",
+                "mode": (
+                    "live"
+                    if self.server.live
+                    else "demo"
+                ),
+            })
+
+        # ====================================================
+        # SERVE CRESCENDO LEADERBOARD
+        # ====================================================
+
+        if path in ("/", "/index.html"):
+
+            html_path = (
                 Path(__file__)
                 .with_name("index.html")
-                .read_bytes()
             )
+
+            if not html_path.is_file():
+
+                return self.respond(
+                    {
+                        "error": (
+                            "Leaderboard HTML not found"
+                        )
+                    },
+                    404,
+                )
 
             return self.respond(
-                html,
-                content_type="text/html; charset=utf-8",
+                html_path.read_bytes(),
+                content_type=(
+                    "text/html; charset=utf-8"
+                ),
             )
-        
-                # ==================================================
-        # SERVE CRESCENDO CAMPAIGNS JAVASCRIPT
-        # ==================================================
 
-        if self.path == "/crescendo_campaigns_addon.js":
-            js_path = Path(__file__).with_name(
-                "crescendo_campaigns_addon.js"
+        # ====================================================
+        # SERVE CRESCENDO CAMPAIGNS JAVASCRIPT
+        # ====================================================
+
+        if path == "/crescendo_campaigns_addon.js":
+
+            js_path = (
+                Path(__file__)
+                .with_name(
+                    "crescendo_campaigns_addon.js"
+                )
             )
 
             if not js_path.is_file():
+
                 return self.respond(
-                    {"error": "Campaigns JavaScript not found"},
+                    {
+                        "error": (
+                            "Campaigns JavaScript not found"
+                        )
+                    },
                     404,
                 )
 
             return self.respond(
                 js_path.read_bytes(),
-                content_type="application/javascript; charset=utf-8",
+                content_type=(
+                    "application/javascript; charset=utf-8"
+                ),
             )
 
-        if self.path != "/api/leaderboard":
+        # ====================================================
+        # API ROUTING
+        # ====================================================
+
+        if path != "/api/leaderboard":
+
             return self.respond(
                 {"error": "Not found"},
                 404,
             )
 
+        # ====================================================
+        # BUILD LEADERBOARD DATA
+        # ====================================================
+
         entries = []
         token = None
 
+        # ----------------------------------------------------
+        # SOUNDCHARTS AUTHENTICATION
+        # ----------------------------------------------------
+
         if self.server.live:
+
             try:
+
                 token = access_token(
                     self.server.client_id,
                     self.server.client_secret,
                 )
+
             except Exception as exc:
-                return self.respond({
-                    "error": (
-                        "Authentication failed: "
-                        + str(exc)
-                    )
-                }, 502)
+
+                print(
+                    "Soundcharts authentication error:",
+                    repr(exc),
+                    flush=True,
+                )
+
+                return self.respond(
+                    {
+                        "error": (
+                            "Soundcharts authentication failed"
+                        )
+                    },
+                    502,
+                )
+
+        # ----------------------------------------------------
+        # FETCH AND ANALYZE ARTISTS
+        # ----------------------------------------------------
 
         for song in SONGS:
 
+            # DEMO MODE
+
             if not self.server.live:
+
                 demo_rows = (
                     MAC
                     if song["artist"] == "Mac Ayres"
@@ -549,32 +640,52 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 )
 
-            else:
-                try:
-                    metadata, rows = fetch_song(
-                        song,
-                        token,
-                    )
+                continue
 
-                    entries.append(
-                        analyze(
-                            metadata,
-                            rows,
-                            "live",
-                        )
-                    )
+            # LIVE MODE
 
-                except Exception as exc:
-                    entry = analyze(
-                        song,
-                        [],
+            try:
+
+                metadata, rows = fetch_song(
+                    song,
+                    token,
+                )
+
+                entries.append(
+                    analyze(
+                        metadata,
+                        rows,
                         "live",
                     )
+                )
 
-                    entry["status"] = "error"
-                    entry["note"] = str(exc)
+            except Exception as exc:
 
-                    entries.append(entry)
+                print(
+                    "Soundcharts artist fetch error:",
+                    song.get("artist", "Unknown"),
+                    repr(exc),
+                    flush=True,
+                )
+
+                entry = analyze(
+                    song,
+                    [],
+                    "live",
+                )
+
+                entry["status"] = "error"
+
+                # Avoid exposing internal API errors publicly.
+                entry["note"] = (
+                    "Unable to retrieve live data"
+                )
+
+                entries.append(entry)
+
+        # ====================================================
+        # CALCULATE CRESCENDO SCORES
+        # ====================================================
 
         assign_scores(entries)
 
@@ -585,7 +696,11 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
 
-        self.respond({
+        # ====================================================
+        # RETURN LEADERBOARD JSON
+        # ====================================================
+
+        return self.respond({
             "mode": (
                 "live"
                 if self.server.live
