@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Crescendo — Artist Leaderboard</title>
+    <style>
+        :root {
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+            color: #f5f5fc;
+            background: #080b14
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        body {
+            margin: 0;
+            background: radial-gradient(ellipse at 85% -5%, #282057 0, transparent 42%), #080b14
+        }
+
+        .wrap {
+            max-width: 1230px;
+            margin: auto;
+            padding: 30px 28px 70px
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #25283a;
+            padding-bottom: 26px
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            font-size: 25px;
+            font-weight: 850;
+            letter-spacing: -1px
+        }
+
+        .logo {
+            width: 38px;
+            height: 38px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #d6a4ff, #715bff);
+            display: grid;
+            place-items: center;
+            color: #16102b
+        }
+
+        .muted {
+            color: #929bb7
+        }
+
+        .status {
+            border: 1px solid #38384f;
+            background: #151727;
+            border-radius: 100px;
+            padding: 9px 15px;
+            font-size: 12px
+        }
+
+        .status:before {
+            content: '●';
+            color: #78e6b4;
+            margin-right: 9px
+        }
+
+        .hero {
+            padding: 66px 0 37px
+        }
+
+        .eyebrow {
+            font-size: 12px;
+            color: #b3a1ff;
+            font-weight: 800;
+            letter-spacing: 2px
+        }
+
+        .hero h1 {
+            font-size: clamp(37px, 5vw, 60px);
+            letter-spacing: -2.8px;
+            margin: 13px 0 12px;
+            line-height: 1.05
+        }
+
+        .hero p {
+            color: #a7aec6;
+            max-width: 670px;
+            line-height: 1.7;
+            margin: 0
+        }
+
+        .highlight {
+            color: #c7b5ff
+        }
+
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin: 23px 0 26px
+        }
+
+        .card,
+        .panel {
+            background: linear-gradient(145deg, #171b2c, #111522);
+            border: 1px solid #2c3047;
+            border-radius: 20px
+        }
+
+        .card {
+            padding: 25px
+        }
+
+        .card .label {
+            font-size: 13px;
+            color: #9ca5be
+        }
+
+        .card .number {
+            font-size: 33px;
+            font-weight: 800;
+            letter-spacing: -1px;
+            margin: 14px 0 7px
+        }
+
+        .card .foot {
+            font-size: 12px;
+            color: #858fa8
+        }
+
+        .panel {
+            overflow: hidden;
+            margin-top: 19px
+        }
+
+        .panel-head {
+            padding: 25px 27px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px
+        }
+
+        .panel-head h2 {
+            font-size: 20px;
+            margin: 6px 0 0;
+            letter-spacing: -.5px
+        }
+
+        .tag {
+            background: #28233e;
+            color: #d5c6ff;
+            padding: 9px 12px;
+            border-radius: 9px;
+            font-size: 12px;
+            font-weight: 700
+        }
+
+        .table-scroll {
+            overflow-x: auto
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            min-width: 870px
+        }
+
+        th {
+            font-size: 11px;
+            letter-spacing: 1.1px;
+            text-transform: uppercase;
+            color: #8c96af;
+            background: #101321;
+            padding: 17px 22px
+        }
+
+        td {
+            padding: 21px 22px;
+            border-top: 1px solid #2a2d40;
+            font-size: 14px
+        }
+
+        tbody tr:hover {
+            background: #1c2034
+        }
+
+        .rank {
+            font-size: 19px;
+            font-weight: 800;
+            color: #d6c3ff
+        }
+
+        .artist {
+            font-weight: 800;
+            font-size: 15px
+        }
+
+        .song {
+            font-size: 12px;
+            color: #9ca4bd;
+            margin-top: 5px
+        }
+
+        .avatar {
+            display: inline-grid;
+            place-items: center;
+            background: linear-gradient(135deg, #5e4c9b, #b68ca6);
+            border-radius: 12px;
+            width: 42px;
+            height: 42px;
+            font-weight: 800;
+            margin-right: 12px;
+            vertical-align: middle
+        }
+
+        .artist-cell {
+            display: flex;
+            align-items: center;
+            gap: 12px
+        }
+
+        .artist-photo {
+            width: 46px;
+            height: 46px;
+            flex: none;
+            border-radius: 13px;
+            object-fit: cover;
+            border: 1px solid #6e5d9e;
+            background: #25203c
+        }
+
+        .avatar {
+            margin-right: 0;
+            flex: none
+        }
+
+        .artist-photo[hidden] {
+            display: none
+        }
+
+        .green {
+            color: #6fe2b0
+        }
+
+        .red {
+            color: #ff9b9f
+        }
+
+        .score {
+            font-weight: 850;
+            color: #e0d5ff
+        }
+
+        .coin {
+            font-weight: 850;
+            color: #d3b8ff
+        }
+
+        .small {
+            font-size: 11px;
+            color: #8d96b0;
+            margin-top: 5px
+        }
+
+        .bottom {
+            display: grid;
+            grid-template-columns: 1.15fr .85fr;
+            gap: 18px
+        }
+
+        .text {
+            color: #aeb5cb;
+            line-height: 1.75;
+            font-size: 14px
+        }
+
+        .legend {
+            display: flex;
+            gap: 13px;
+            flex-wrap: wrap;
+            color: #99a2bb;
+            font-size: 12px;
+            margin: 0 27px 24px
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            background: #b49dff;
+            display: inline-block;
+            border-radius: 50%;
+            margin-right: 6px
+        }
+
+        .warning {
+            color: #ffd4a2;
+            background: #36291e;
+            border: 1px solid #6d5235;
+            padding: 14px 17px;
+            border-radius: 11px;
+            margin: 15px 0;
+            display: none
+        }
+
+        .link {
+            color: #b6a3ff;
+            text-decoration: none
+        }
+
+        .fine {
+            color: #858eaa;
+            font-size: 12px;
+            line-height: 1.65;
+            margin-top: 15px
+        }
+
+        button {
+            background: #352b59;
+            border: 1px solid #62548c;
+            color: #f1e9ff;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-weight: 700;
+            cursor: pointer
+        }
+
+        button:hover {
+            background: #4b3b7e
+        }
+
+        @media(max-width:750px) {
+            .wrap {
+                padding: 18px 15px 45px
+            }
+
+            .hero {
+                padding: 40px 0 18px
+            }
+
+            .cards {
+                grid-template-columns: 1fr
+            }
+
+            .bottom {
+                grid-template-columns: 1fr
+            }
+
+            .panel-head {
+                align-items: flex-start;
+                flex-direction: column
+            }
+
+            header {
+                gap: 10px
+            }
+
+            .brand {
+                font-size: 20px
+            }
+        }
+    </style>
+
+    <script src="/crescendo_campaigns_addon.js" defer></script>
+</head>
+
+
+<body>
+    <div class="wrap">
+        <header>
+            <div class="brand"><span class="logo">◢</span>Crescendo<span style="color:#ac91ff">.</span></div><span
+                class="status" id="status">Connecting to data</span>
+        </header>
+        <section class="hero">
+            <div class="eyebrow">THE NEXT GENERATION OF ARTIST REWARDS</div>
+            <h1>Great music deserves<br><span class="highlight">greater rewards.</span></h1>
+            <p>Meet the Crescendo leaderboard: a streaming-powered ranking system designed to recognize artists for the
+                momentum they're building.</p>
+        </section>
+        <section class="cards">
+            <div class="card">
+                <div class="label">Artists on the board</div>
+                <div class="number" id="artistCount">2</div>
+                <div class="foot">Founding demo lineup</div>
+            </div>
+            <div class="card">
+                <div class="label">Illustrative weekly rewards pool</div>
+                <div class="number">10,000 <span style="font-size:17px;color:#baa7ff">CRES</span></div>
+                <div class="foot">Simulation only · no tokens issued</div>
+            </div>
+            <div class="card">
+                <div class="label">Leaderboard model</div>
+                <div class="number" style="font-size:25px">Stream Score <span style="color:#b49aff">/100</span></div>
+                <div class="foot">Growth + streaming volume · prototype</div>
+            </div>
+        </section>
+        <div class="warning" id="warning"></div>
+        <section class="panel">
+            <div class="panel-head">
+                <div>
+                    <div class="eyebrow">THE CRESCENDO CHARTS</div>
+                    <h2>Artist leaderboard</h2>
+                </div><button id="refresh" onclick="load()">↻ Refresh data</button>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Rank</th>
+                            <th>Artist / Song</th>
+                            <th>Monthly streams</th>
+                            <th>Weekly growth</th>
+                            <th>Stream Score</th>
+                            <th>CRES available*</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rows">
+                        <tr>
+                            <td colspan="6" class="muted">Loading artist data…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="legend"><span><span class="dot"></span>Ranked by prototype Stream Score</span><span>Monthly =
+                    last 30 days</span><span>Growth = latest 7 days vs preceding 7</span></div>
+        </section>
+        <div class="bottom">
+            <section class="panel" style="padding:27px">
+                <div class="eyebrow">HOW CRESCENDO WORKS</div>
+                <h2 style="margin:9px 0">Stream. Grow. Earn.</h2>
+                <p class="text">We turn measurable streaming growth into a Stream Score. Artists climb the leaderboard
+                    based on their performance, and a future rewards engine could allocate CRES tokens from a defined
+                    pool. Smaller artists can compete on growth—not just raw audience size.</p>
+                <div class="fine">*CRES amounts are hypothetical reward estimates for demonstration. They are not
+                    claimable, issued, or guaranteed, and token economics have not been finalized.</div>
+            </section>
+            <section class="panel" style="padding:27px">
+                <div class="eyebrow">PROOF OF CONCEPT</div>
+                <h2 style="margin:9px 0">Powered by Soundcharts</h2>
+                <p class="text">Spotify cumulative stream observations are used to calculate 7-day, 14-day, and 30-day
+                    differences. Artist and song details resolve directly from Spotify track IDs in live mode.</p>
+                <div class="fine">Demo mode includes verified historical Mac Ayres data. Sunflower Bean requires the
+                    live API to populate its row. <a class="link"
+                        href="https://developers.soundcharts.com/api/reference/song/get-audience" target="_blank"
+                        rel="noreferrer">Soundcharts documentation ↗</a></div>
+            </section>
+        </div>
+    </div>
+    <script>
+        const fmt = n => n == null ? '—' : Math.round(n).toLocaleString('en-US'); const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        function photoUrl(value) { try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'assets.soundcharts.com' ? u.href : null } catch { return null } }
+        async function load() { document.getElementById('refresh').disabled = true; try { const res = await fetch('/api/leaderboard', { cache: 'no-store' }); const data = await res.json(); if (!res.ok) throw Error(data.error || 'Request failed'); document.getElementById('status').textContent = data.mode === 'live' ? 'Live Soundcharts API' : 'Demo · saved API snapshot'; document.getElementById('artistCount').textContent = data.artists.length; document.getElementById('rows').innerHTML = data.artists.map(a => { a.artistImage = photoUrl(a.artistImage); return `<tr><td><span class="rank">${a.rank ? '#' + a.rank : '—'}</span></td><td><div class="artist-cell"><span class="avatar" ${a.artistImage ? 'hidden' : ''}>${esc(a.artist.split(' ').map(w => w[0]).join('').slice(0, 2))}</span>${a.artistImage ? `<img class="artist-photo" src="${esc(a.artistImage)}" alt="${esc(a.artist)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true;this.previousElementSibling.hidden=false">` : ''}<div><div class="artist">${esc(a.artist)}</div><div class="song">${esc(a.song || 'Song pending lookup')}</div></div></div></td><td><strong>${fmt(a.monthly)}</strong><div class="small">${a.asOf ? 'As of ' + esc(a.asOf) : 'Awaiting data'}</div></td><td><strong class="${a.wow == null ? '' : a.wow >= 0 ? 'green' : 'red'}">${a.wow == null ? '—' : (a.wow > 0 ? '+' : '') + a.wow.toFixed(1) + '%'}</strong><div class="small">${a.weekly == null ? 'Pending' : fmt(a.weekly) + ' this week'}</div></td><td><span class="score">${a.score == null ? '—' : a.score + '/100'}</span></td><td><span class="coin">${a.reward == null ? 'Pending' : fmt(a.reward) + ' CRES'}</span><div class="small">${a.reward == null ? esc(a.note || 'Not enough data') : 'Illustrative weekly allocation'}</div></td></tr>` }).join(''); const warnings = data.artists.filter(a => a.status === 'error'); const warn = document.getElementById('warning'); warn.style.display = warnings.length ? 'block' : 'none'; warn.textContent = warnings.map(a => a.artist + ': ' + a.note).join(' · '); } catch (e) { const warn = document.getElementById('warning'); warn.style.display = 'block'; warn.textContent = 'Unable to load data: ' + e.message; document.getElementById('status').textContent = 'Connection issue'; } finally { document.getElementById('refresh').disabled = false; } }
+        load();
+    </script>
+</body>
+
+</html>
