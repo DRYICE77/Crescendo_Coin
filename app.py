@@ -604,6 +604,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
+
 # ============================================================
 # 9. START APPLICATION
 # ============================================================
@@ -620,31 +621,69 @@ if __name__ == "__main__":
     parser.add_argument(
         "--port",
         type=int,
-        default=8765,
+        default=None,
     )
 
     args = parser.parse_args()
+
+    # --------------------------------------------------------
+    # SERVER CONFIGURATION
+    # --------------------------------------------------------
+
+    # Railway supplies PORT through environment variables.
+    # Local development defaults to port 8765.
+
+    port = (
+        args.port
+        if args.port is not None
+        else int(os.getenv("PORT", "8765"))
+    )
+
+    host = "0.0.0.0"
+
+    # --------------------------------------------------------
+    # SOUNDCHARTS AUTHENTICATION
+    # --------------------------------------------------------
 
     client_id = None
     client_secret = None
 
     if args.live:
 
-        client_id = (
-            os.getenv("SOUNDCHARTS_CLIENT_ID")
-            or input(
-                "Soundcharts Client ID: "
-            ).strip()
+        client_id = os.getenv(
+            "SOUNDCHARTS_CLIENT_ID"
         )
 
-        client_secret = (
-            os.getenv("SOUNDCHARTS_CLIENT_SECRET")
-            or getpass.getpass(
-                "Soundcharts Client Secret: "
-            )
+        client_secret = os.getenv(
+            "SOUNDCHARTS_CLIENT_SECRET"
         )
+
+        # Interactive credentials for local development only.
+        # Never prompt for credentials in Railway.
+
+        if not client_id or not client_secret:
+
+            if not os.getenv("RAILWAY_ENVIRONMENT"):
+
+                if not client_id:
+                    client_id = input(
+                        "Soundcharts Client ID: "
+                    ).strip()
+
+                if not client_secret:
+                    client_secret = getpass.getpass(
+                        "Soundcharts Client Secret: "
+                    )
+
+            else:
+                raise RuntimeError(
+                    "Missing Soundcharts credentials. "
+                    "Configure SOUNDCHARTS_CLIENT_ID and "
+                    "SOUNDCHARTS_CLIENT_SECRET in Railway."
+                )
 
         if not os.getenv("SSL_CERT_FILE"):
+
             try:
                 import certifi
 
@@ -655,8 +694,12 @@ if __name__ == "__main__":
             except ImportError:
                 pass
 
+    # --------------------------------------------------------
+    # START HTTP SERVER
+    # --------------------------------------------------------
+
     server = ThreadingHTTPServer(
-        ("127.0.0.1", args.port),
+        (host, port),
         Handler,
     )
 
@@ -665,25 +708,44 @@ if __name__ == "__main__":
     server.client_secret = client_secret
 
     print(
-        "\nCRESCENDO COIN LEADERBOARD"
+        "\nCRESCENDO COIN LEADERBOARD",
+        flush=True,
     )
 
     print(
-        "http://127.0.0.1:"
-        + str(args.port)
+        f"Listening on: {host}:{port}",
+        flush=True,
+    )
+
+    print(
+        f"Local URL: http://127.0.0.1:{port}",
+        flush=True,
     )
 
     print(
         "Mode:",
         "LIVE" if args.live else "DEMO",
+        flush=True,
     )
 
     print(
-        "Artist images: ENABLED"
+        "Artist images: ENABLED",
+        flush=True,
     )
 
     print(
-        "Press Control+C to stop\n"
+        "Press Control+C to stop\n",
+        flush=True,
     )
 
-    server.serve_forever()
+    try:
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+        print(
+            "\nShutting down Crescendo...",
+            flush=True,
+        )
+
+    finally:
+        server.server_close()
