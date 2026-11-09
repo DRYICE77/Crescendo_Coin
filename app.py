@@ -90,12 +90,18 @@ MAC = [
 ]
 
 
+
 # ============================================================
 # 3. SOUNDCHARTS API HELPERS
+#
+# Shared HTTP helper for Soundcharts and Instagram.
+# Adds safe diagnostics for upstream API failures.
 # ============================================================
 
 def fetch_json(url, token=None, data=None, basic=None):
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+    }
 
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -110,14 +116,70 @@ def fetch_json(url, token=None, data=None, basic=None):
         url,
         data=data,
         headers=headers,
-        method="POST" if data else "GET",
+        method="POST" if data is not None else "GET",
     )
 
-    with urllib.request.urlopen(
-        request,
-        timeout=25,
-    ) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=25,
+        ) as response:
+            return json.load(response)
+
+    except urllib.error.HTTPError as exc:
+        raw_body = exc.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        # Parse only safe diagnostic fields.
+        try:
+            payload = json.loads(raw_body)
+            error = payload.get("error", {})
+
+            if isinstance(error, dict):
+                details = {
+                    "message": error.get("message"),
+                    "type": error.get("type"),
+                    "code": error.get("code"),
+                    "subcode": error.get("error_subcode"),
+                }
+            else:
+                details = {
+                    "message": "Unexpected API error format"
+                }
+
+        except (ValueError, AttributeError):
+            details = {
+                "message": "Non-JSON API error response"
+            }
+
+        # Never print request URLs, headers,
+        # credentials, or access tokens.
+        print(
+            "[API HTTP ERROR]",
+            "status:",
+            exc.code,
+            "details:",
+            details,
+            flush=True,
+        )
+
+        raise RuntimeError(
+            "Upstream API returned HTTP "
+            + str(exc.code)
+        ) from None
+
+    except urllib.error.URLError as exc:
+        print(
+            "[API NETWORK ERROR]",
+            type(exc.reason).__name__,
+            flush=True,
+        )
+
+        raise RuntimeError(
+            "Unable to reach upstream API"
+        ) from None
 
 
 def access_token(client_id, client_secret):
