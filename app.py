@@ -630,64 +630,94 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
 
-         # ====================================================
-        # INSTAGRAM API CONNECTION TEST
-        # ====================================================
+  
+# ====================================================
+# INSTAGRAM API CONNECTION TEST
+# ====================================================
 
-        if path == "/api/instagram/test":
+if path == "/api/instagram/test":
 
-            instagram_token = os.getenv(
-                "INSTAGRAM_ACCESS_TOKEN"
-            )
+    instagram_token = os.getenv(
+        "INSTAGRAM_ACCESS_TOKEN", ""
+    )
 
-            if not instagram_token:
-                return self.respond(
-                    {"error": "Instagram token not configured"},
-                    503,
-                )
+    token_check = {
+        "configured": bool(instagram_token),
+        "length": len(instagram_token),
+        "has_whitespace": any(
+            c.isspace() for c in instagram_token
+        ),
+        "has_bearer_prefix": (
+            instagram_token.lower().startswith("bearer ")
+        ),
+        "has_quotes": (
+            instagram_token.startswith(("'", '"'))
+            or instagram_token.endswith(("'", '"'))
+        ),
+    }
 
-            try:
-                params = urllib.parse.urlencode({
-                    "fields": "id,username,account_type",
-                    "access_token": instagram_token,
-                })
+    print(
+        "[INSTAGRAM TOKEN DIAGNOSTIC]",
+        token_check,
+        flush=True,
+    )
 
-                url = (
-                    "https://graph.instagram.com/me?"
-                    + params
-                )
+    if not instagram_token:
+        return self.respond({
+            "connected": False,
+            "error": "Instagram token not configured",
+        }, 503)
 
-                result = fetch_json(url)
+    if (
+        token_check["has_whitespace"]
+        or token_check["has_bearer_prefix"]
+        or token_check["has_quotes"]
+    ):
+        return self.respond({
+            "connected": False,
+            "error": "Instagram token formatting invalid",
+        }, 503)
 
-                print(
-                    "Instagram API test succeeded:",
-                    result.get("username"),
-                    flush=True,
-                )
+    try:
+        url = (
+            "https://graph.instagram.com/me"
+            "?fields=id,username,account_type"
+        )
 
-                return self.respond({
-                    "connected": True,
-                    "instagram": {
-                        "id": result.get("id"),
-                        "username": result.get("username"),
-                        "account_type": result.get(
-                            "account_type"
-                        ),
-                    },
-                })
+        result = fetch_json(
+            url,
+            token=instagram_token,
+        )
 
-            except Exception as exc:
+        print(
+            "[INSTAGRAM API SUCCESS]",
+            result.get("username"),
+            flush=True,
+        )
 
-                print(
-                    "Instagram API test failed:",
-                    repr(exc),
-                    flush=True,
-                )
+        return self.respond({
+            "connected": True,
+            "instagram": {
+                "id": result.get("id"),
+                "username": result.get("username"),
+                "account_type": result.get(
+                    "account_type"
+                ),
+            },
+        })
 
-                return self.respond({
-                    "connected": False,
-                    "error": "Instagram API request failed",
-                }, 502)
+    except Exception as exc:
+
+        print(
+            "[INSTAGRAM API FAILED]",
+            type(exc).__name__,
+            flush=True,
+        )
+
+        return self.respond({
+            "connected": False,
+            "error": "Instagram API request failed",
+        }, 502)
 
         # ====================================================
         # API ROUTING
