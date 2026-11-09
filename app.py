@@ -568,6 +568,65 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
 
+ # ====================================================
+# INSTAGRAM API CONNECTION TEST
+# ====================================================
+
+if path == "/api/instagram/test":
+
+    instagram_token = os.getenv(
+        "INSTAGRAM_ACCESS_TOKEN"
+    )
+
+    if not instagram_token:
+        return self.respond(
+            {"error": "Instagram token not configured"},
+            503,
+        )
+
+    try:
+        params = urllib.parse.urlencode({
+            "fields": "id,username,account_type",
+            "access_token": instagram_token,
+        })
+
+        url = (
+            "https://graph.instagram.com/me?"
+            + params
+        )
+
+        result = fetch_json(url)
+
+        print(
+            "Instagram API test succeeded:",
+            result.get("username"),
+            flush=True,
+        )
+
+        return self.respond({
+            "connected": True,
+            "instagram": {
+                "id": result.get("id"),
+                "username": result.get("username"),
+                "account_type": result.get(
+                    "account_type"
+                ),
+            },
+        })
+
+    except Exception as exc:
+
+        print(
+            "Instagram API test failed:",
+            repr(exc),
+            flush=True,
+        )
+
+        return self.respond({
+            "connected": False,
+            "error": "Instagram API request failed",
+        }, 502)
+
         # ====================================================
         # API ROUTING
         # ====================================================
