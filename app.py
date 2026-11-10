@@ -683,34 +683,103 @@ class Handler(BaseHTTPRequestHandler):
                 ) as response:
                     result = json.load(response)
 
-                account_id = result.get("id")
+             
+                # ============================================
+                # META TOKEN RESPONSE VALIDATION
+                # ============================================
+
+                print(
+                    "[META TOKEN TEST] Response type:",
+                    type(result).__name__,
+                    flush=True,
+                )
+
+                # Meta should return a dictionary containing
+                # the authenticated identity.
+
+                if isinstance(result, dict):
+                    print(
+                        "[META TOKEN TEST] Response keys:",
+                        list(result.keys()),
+                        flush=True,
+                    )
+
+                    account = result
+
+                elif isinstance(result, list):
+                    print(
+                        "[META TOKEN TEST] Unexpected list response",
+                        "item_count:",
+                        len(result),
+                        flush=True,
+                    )
+
+                    return self.respond({
+                        "connected": False,
+                        "test": "facebook_graph_token",
+                        "response_type": "list",
+                        "item_count": len(result),
+                        "error": (
+                            "Meta returned a list instead "
+                            "of an account identity"
+                        ),
+                    }, 502)
+
+                else:
+                    print(
+                        "[META TOKEN TEST] Unexpected response type:",
+                        type(result).__name__,
+                        flush=True,
+                    )
+
+                    return self.respond({
+                        "connected": False,
+                        "test": "facebook_graph_token",
+                        "response_type": type(result).__name__,
+                        "error": "Unexpected Meta response",
+                    }, 502)
+
+                # ============================================
+                # VALIDATE ACCOUNT ID
+                # ============================================
+
+                account_id = account.get("id")
+
                 if not account_id:
                     print(
                         "[META TOKEN TEST] Missing identity in response",
                         flush=True,
                     )
+
                     return self.respond({
                         "connected": False,
                         "test": "facebook_graph_token",
+                        "response_keys": list(account.keys()),
                         "error": "Meta returned no account ID",
                     }, 502)
+
+                # ============================================
+                # TOKEN ACCEPTED
+                # ============================================
 
                 print(
                     "[META TOKEN TEST] Accepted; identity returned",
                     flush=True,
                 )
+
                 return self.respond({
                     "connected": True,
                     "test": "facebook_graph_token",
                     "identity_type": "unconfirmed_facebook_graph_identity",
                     "id": account_id,
-                    "name": result.get("name"),
+                    "name": account.get("name"),
                     "instagram_verified": False,
                     "note": (
                         "Token accepted by Facebook Graph API; "
                         "Instagram account ownership not yet verified"
                     ),
                 })
+
 
             except urllib.error.HTTPError as exc:
                 # Only expose the numeric Meta error codes.
