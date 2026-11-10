@@ -596,7 +596,323 @@ class Handler(BaseHTTPRequestHandler):
                 html_path.read_bytes(),
                 content_type=(
                     "text/html; charset=utf-8"
+                ),
+            )
 
+        # ====================================================
+        # SERVE CRESCENDO CAMPAIGNS JAVASCRIPT
+        # ====================================================
+
+        if path == "/crescendo_campaigns_addon.js":
+
+            js_path = (
+                Path(__file__)
+                .with_name(
+                    "crescendo_campaigns_addon.js"
+                )
+            )
+
+            if not js_path.is_file():
+
+                return self.respond(
+                    {
+                        "error": (
+                            "Campaigns JavaScript not found"
+                        )
+                    },
+                    404,
+                )
+
+            return self.respond(
+                js_path.read_bytes(),
+                content_type=(
+                    "application/javascript; charset=utf-8"
+                ),
+            )
+
+  
+        # ====================================================
+        # META EAA TOKEN DIAGNOSTIC (NOT ARTIST VERIFICATION)
+        # ====================================================
+
+        if path == "/api/instagram/test":
+            # This is a temporary diagnostic. Do not use a
+            # shared server token to verify individual artists.
+            instagram_token = os.getenv(
+                "INSTAGRAM_ACCESS_TOKEN", ""
+            )
+
+            if not instagram_token:
+                return self.respond({
+                    "connected": False,
+                    "test": "facebook_graph_token",
+                    "error": "INSTAGRAM_ACCESS_TOKEN is not configured",
+                }, 503)
+
+            if (
+                any(c.isspace() for c in instagram_token)
+                or instagram_token.lower().startswith("bearer ")
+                or instagram_token.startswith(("'", '"'))
+                or instagram_token.endswith(("'", '"'))
+            ):
+                return self.respond({
+                    "connected": False,
+                    "test": "facebook_graph_token",
+                    "error": "Token formatting appears invalid",
+                }, 503)
+
+            # A Facebook Graph /me result may be a Facebook
+            # identity, NOT the connected Instagram account.
+            # This test does not set an artist's verified status.
+            url = (
+                "https://graph.facebook.com/v24.0/me"
+                "?fields=id,name"
+            )
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": "Bearer " + instagram_token,
+                },
+                method="GET",
+            )
+
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=25
+                ) as response:
+                    result = json.load(response)
+
+                account_id = result.get("id")
+                if not account_id:
+                    print(
+                        "[META TOKEN TEST] Missing identity in response",
+                        flush=True,
+                    )
+                    return self.respond({
+                        "connected": False,
+                        "test": "facebook_graph_token",
+                        "error": "Meta returned no account ID",
+                    }, 502)
+
+                print(
+                    "[META TOKEN TEST] Accepted; identity returned",
+                    flush=True,
+                )
+                return self.respond({
+                    "connected": True,
+                    "test": "facebook_graph_token",
+                    "identity_type": "unconfirmed_facebook_graph_identity",
+                    "id": account_id,
+                    "name": result.get("name"),
+                    "instagram_verified": False,
+                    "note": (
+                        "Token accepted by Facebook Graph API; "
+                        "Instagram account ownership not yet verified"
+                    ),
+                })
+
+            except urllib.error.HTTPError as exc:
+                # Only expose the numeric Meta error codes.
+                # Do not log raw response bodies or tokens.
+                error_code = None
+                error_subcode = None
+                try:
+                    payload = json.loads(exc.read().decode("utf-8"))
+                    meta_error = payload.get("error", {})
+                    if isinstance(meta_error, dict):
+                        error_code = meta_error.get("code")
+                        error_subcode = meta_error.get("error_subcode")
+                except (ValueError, UnicodeDecodeError, AttributeError):
+                    pass
+
+                print(
+                    "[META TOKEN TEST] HTTP", exc.code,
+                    "Meta code", error_code,
+                    "subcode", error_subcode,
+                    flush=True,
+                )
+                return self.respond({
+                    "connected": False,
+                    "test": "facebook_graph_token",
+                    "upstream_status": exc.code,
+                    "meta_error_code": error_code,
+                    "meta_error_subcode": error_subcode,
+                    "error": "Meta rejected the diagnostic request",
+                }, 502)
+
+            except (urllib.error.URLError, TimeoutError) as exc:
+                print(
+                    "[META TOKEN TEST] Network failure:",
+                    type(exc).__name__, flush=True,
+                )
+                return self.respond({
+                    "connected": False,
+                    "test": "facebook_graph_token",
+                    "error": "Unable to reach Meta API",
+                }, 502)
+
+            except (ValueError, TypeError, KeyError) as exc:
+                print(
+                    "[META TOKEN TEST] Unexpected response:",
+                    type(exc).__name__, flush=True,
+                )
+                return self.respond({
+                    "connected": False,
+                    "test": "facebook_graph_token",
+                    "error": "Unexpected Meta API response",
+                }, 502)
+
+
+        # ====================================================
+        # API ROUTING
+        # ====================================================
+
+        if path != "/api/leaderboard":
+
+            return self.respond(
+                {"error": "Not found"},
+                404,
+            )
+
+        # ====================================================
+        # BUILD LEADERBOARD DATA
+        # ====================================================
+
+        entries = []
+        token = None
+
+        # ----------------------------------------------------
+        # SOUNDCHARTS AUTHENTICATION
+        # ----------------------------------------------------
+
+        if self.server.live:
+
+            try:
+
+                token = access_token(
+                    self.server.client_id,
+                    self.server.client_secret,
+                )
+
+            except Exception as exc:
+
+                print(
+                    "Soundcharts authentication error:",
+                    repr(exc),
+                    flush=True,
+                )
+
+                return self.respond(
+                    {
+                        "error": (
+                            "Soundcharts authentication failed"
+                        )
+                    },
+                    502,
+                )
+
+        # ----------------------------------------------------
+        # FETCH AND ANALYZE ARTISTS
+        # ----------------------------------------------------
+
+        for song in SONGS:
+
+            # DEMO MODE
+
+            if not self.server.live:
+
+                demo_rows = (
+                    MAC
+                    if song["artist"] == "Mac Ayres"
+                    else []
+                )
+
+                entries.append(
+                    analyze(
+                        song,
+                        demo_rows,
+                        "demo",
+                    )
+                )
+
+                continue
+
+            # LIVE MODE
+
+            try:
+
+                metadata, rows = fetch_song(
+                    song,
+                    token,
+                )
+
+                entries.append(
+                    analyze(
+                        metadata,
+                        rows,
+                        "live",
+                    )
+                )
+
+            except Exception as exc:
+
+                print(
+                    "Soundcharts artist fetch error:",
+                    song.get("artist", "Unknown"),
+                    repr(exc),
+                    flush=True,
+                )
+
+                entry = analyze(
+                    song,
+                    [],
+                    "live",
+                )
+
+                entry["status"] = "error"
+
+                # Avoid exposing internal API errors publicly.
+                entry["note"] = (
+                    "Unable to retrieve live data"
+                )
+
+                entries.append(entry)
+
+        # ====================================================
+        # CALCULATE CRESCENDO SCORES
+        # ====================================================
+
+        assign_scores(entries)
+
+        entries.sort(
+            key=lambda r: (
+                r["rank"] is None,
+                r["rank"] or 99,
+            )
+        )
+
+        # ====================================================
+        # RETURN LEADERBOARD JSON
+        # ====================================================
+
+        return self.respond({
+            "mode": (
+                "live"
+                if self.server.live
+                else "demo"
+            ),
+            "artists": entries,
+            "pool": WEEKLY_REWARD_POOL,
+            "rewardsAreIllustrative": True,
+            "method": (
+                "Prototype score: "
+                "20 base + up to 25 volume "
+                "+ up to 55 growth. "
+                "Illustrative 10,000 CRES "
+                "weekly reward pool."
+            ),
+        })
 
 # ============================================================
 # 9. START APPLICATION
