@@ -554,8 +554,41 @@ def meta_oauth_json(url, *, data=None, token=None):
 
 
 def discover_instagram_accounts(access_token):
-    # Facebook Login path: a user's managed Pages can expose
-    # Instagram professional accounts. Never assume /me is Instagram.
+    """Probe an explicitly configured IG test asset, then Page discovery.
+
+    These probes confirm token access only, not artist identity or consent
+    to claim an artist profile. Never fall back to the server's system token.
+    """
+    accounts = []
+    diagnostics = []
+    known_id = os.getenv("CRESCENDO_TEST_INSTAGRAM_ID", "17841457229549813").strip()
+
+    if known_id and known_id.isdecimal():
+        url = (
+            "https://graph.facebook.com/v24.0/"
+            + known_id
+            + "?"
+            + urllib.parse.urlencode({"fields": "id,username"})
+        )
+        try:
+            payload = meta_oauth_json(url, token=access_token)
+            returned_id = str(payload.get("id", ""))
+            if returned_id == known_id:
+                accounts.append({
+                    "id": returned_id,
+                    "username": payload.get("username"),
+                    "source": "direct_asset_probe",
+                })
+                diagnostics.append({"probe": "direct_asset", "result": "matched"})
+            else:
+                diagnostics.append({"probe": "direct_asset", "result": "no_match"})
+        except RuntimeError:
+            diagnostics.append({"probe": "direct_asset", "result": "api_error"})
+    else:
+        diagnostics.append({"probe": "direct_asset", "result": "not_configured"})
+
+    # Pages are useful for Facebook Login, but may be empty for
+    # Instagram business assets authorized through Unified Login.
     url = (
         "https://graph.facebook.com/v24.0/me/accounts?"
         + urllib.parse.urlencode({
@@ -563,18 +596,29 @@ def discover_instagram_accounts(access_token):
             "limit": 100,
         })
     )
-    payload = meta_oauth_json(url, token=access_token)
-    accounts = []
-    for page in payload.get("data", []):
-        if not isinstance(page, dict):
-            continue
-        ig = page.get("instagram_business_account")
-        if isinstance(ig, dict) and ig.get("id"):
-            accounts.append({
-                "id": str(ig["id"]),
-                "username": ig.get("username"),
-            })
-    return accounts
+    try:
+        payload = meta_oauth_json(url, token=access_token)
+        pages = payload.get("data", [])
+        if not isinstance(pages, list):
+            pages = []
+        diagnostics.append({"probe": "pages", "result": "ok", "page_count": len(pages)})
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            ig = page.get("instagram_business_account")
+            if isinstance(ig, dict) and ig.get("id"):
+                ig_id = str(ig["id"])
+                if not any(a["id"] == ig_id for a in accounts):
+                    accounts.append({
+                        "id": ig_id,
+                        "username": ig.get("username"),
+                        "source": "facebook_page",
+                    })
+    except RuntimeError:
+        diagnostics.append({"probe": "pages", "result": "api_error"})
+
+    print("[IG OAUTH] Discovery diagnostics:", diagnostics, flush=True)
+    return accounts, diagnostics
 
 
 # ============================================================
@@ -582,6 +626,15 @@ def discover_instagram_accounts(access_token):
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
+
+    # Never log OAuth authorization codes, state, or any query strings.
+    def log_message(self, format, *args):
+        if args and isinstance(args[0], str):
+            parts = args[0].split(" ")
+            if len(parts) >= 2:
+                parts[1] = parts[1].split("?", 1)[0]
+                args = (" ".join(parts),) + args[1:]
+        super().log_message(format, *args)
 
     # --------------------------------------------------------
     # 8A. STANDARD HTTP RESPONSE
@@ -698,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
             if not state or not supplied_state or not hmac.compare_digest(
                 str(state.get("state", "")), supplied_state
             ):
-                return self.respond({"error": "Invalid or expired OAuth state"}, 400)
+                return self.redirect("/?instagram=invalid_state", [clear_state])
 
             if "error" in query:
                 return self.redirect("/?instagram=cancelled", [clear_state])
@@ -723,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
                 user_token = exchange.get("access_token")
                 if not isinstance(user_token, str) or not user_token:
                     raise RuntimeError("No user token returned")
-                accounts = discover_instagram_accounts(user_token)
+                accounts, diagnostics = discover_instagram_accounts(user_token)
             except RuntimeError:
                 return self.redirect("/?instagram=error", [clear_state])
 
@@ -731,7 +784,8 @@ class Handler(BaseHTTPRequestHandler):
             # No public verified badge is awarded by this proof of concept.
             result = {
                 "iat": int(time.time()),
-                "accounts": accounts[:20],
+                "accounts": accounts[:8],
+                "diagnostics": diagnostics,
                 "status": "connected_test" if accounts else "no_accounts",
                 "artist_verified": False,
             }
@@ -752,6 +806,7 @@ class Handler(BaseHTTPRequestHandler):
                 "connected": result.get("status") == "connected_test",
                 "status": result.get("status"),
                 "accounts": result.get("accounts", []),
+                "diagnostics": result.get("diagnostics", []),
                 "artist_verified": False,
                 "note": "OAuth test only; no artist identity has been verified",
             })
