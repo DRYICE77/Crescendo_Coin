@@ -120,11 +120,38 @@ def fetch_json(url, token=None, data=None, basic=None):
     )
 
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=25,
-        ) as response:
-            return json.load(response)
+      
+                with urllib.request.urlopen(
+                    request, timeout=25
+                ) as response:
+
+                    http_status = response.status
+                    content_type = response.headers.get(
+                        "Content-Type", ""
+                    )
+
+                    raw_body = response.read()
+
+                    print(
+                        "[META RAW RESPONSE]",
+                        "status:", http_status,
+                        "content_type:", content_type,
+                        "body_length:", len(raw_body),
+                        flush=True,
+                    )
+
+                    result = json.loads(raw_body)
+
+                    print(
+                        "[META PARSED RESPONSE]",
+                        "type:", type(result).__name__,
+                        "is_empty_list": (
+                            isinstance(result, list)
+                            and len(result) == 0
+                        ),
+                        flush=True,
+                    )
+
 
     except urllib.error.HTTPError as exc:
         raw_body = exc.read().decode(
