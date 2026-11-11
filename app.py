@@ -8,6 +8,11 @@ Artist photos and Spotify streaming data provided by Soundcharts.
 import argparse
 import base64
 import getpass
+import hashlib
+import hmac
+import secrets
+import time
+from http.cookies import SimpleCookie
 import json
 import os
 import urllib.error
@@ -472,6 +477,107 @@ def assign_scores(rows):
 
 
 # ============================================================
+# 7B. INSTAGRAM OAUTH HELPERS
+# ============================================================
+
+OAUTH_CALLBACK = (
+    "https://crescendocoin-production.up.railway.app"
+    "/auth/instagram/callback"
+)
+OAUTH_STATE_COOKIE = "crescendo_ig_oauth_state"
+OAUTH_RESULT_COOKIE = "crescendo_ig_oauth_result"
+
+
+def oauth_sign(payload, secret):
+    raw = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    mac = hmac.new(secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    return raw + "." + mac
+
+
+def oauth_unsign(value, secret, max_age):
+    try:
+        raw, mac = value.rsplit(".", 1)
+        expected = hmac.new(
+            secret.encode(), raw.encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(mac, expected):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)
+        ))
+        if not isinstance(payload, dict):
+            return None
+        issued = int(payload.get("iat", 0))
+        if issued > time.time() + 60 or time.time() - issued > max_age:
+            return None
+        return payload
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return None
+
+
+def cookie_value(header, name):
+    jar = SimpleCookie()
+    try:
+        jar.load(header or "")
+        return jar[name].value if name in jar else None
+    except Exception:
+        return None
+
+
+def meta_oauth_json(url, *, data=None, token=None):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    request = urllib.request.Request(
+        url, data=data, headers=headers,
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read(65537)
+            if len(body) > 65536:
+                raise ValueError("Meta response too large")
+            result = json.loads(body)
+            if not isinstance(result, dict):
+                raise ValueError("Unexpected Meta JSON response")
+            return result
+    except urllib.error.HTTPError as exc:
+        print("[IG OAUTH] Meta HTTP status:", exc.code, flush=True)
+        raise RuntimeError("Meta authorization request failed") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        print("[IG OAUTH] Upstream failure:", type(exc).__name__, flush=True)
+        raise RuntimeError("Meta authorization request failed") from None
+
+
+def discover_instagram_accounts(access_token):
+    # Facebook Login path: a user's managed Pages can expose
+    # Instagram professional accounts. Never assume /me is Instagram.
+    url = (
+        "https://graph.facebook.com/v24.0/me/accounts?"
+        + urllib.parse.urlencode({
+            "fields": "id,instagram_business_account{id,username}",
+            "limit": 100,
+        })
+    )
+    payload = meta_oauth_json(url, token=access_token)
+    accounts = []
+    for page in payload.get("data", []):
+        if not isinstance(page, dict):
+            continue
+        ig = page.get("instagram_business_account")
+        if isinstance(ig, dict) and ig.get("id"):
+            accounts.append({
+                "id": str(ig["id"]),
+                "username": ig.get("username"),
+            })
+    return accounts
+
+
+# ============================================================
 # 8. HTTP SERVER
 # ============================================================
 
@@ -515,6 +621,25 @@ class Handler(BaseHTTPRequestHandler):
 
         self.wfile.write(data)
 
+    def redirect(self, location, cookies=()):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for cookie in cookies:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def oauth_cookie(self, name, value, max_age):
+        return (
+            f"{name}={value}; Path=/; Max-Age={max_age}; "
+            "HttpOnly; Secure; SameSite=Lax"
+        )
+
+    def oauth_clear_cookie(self, name):
+        return self.oauth_cookie(name, "", 0)
+
     # --------------------------------------------------------
     # 8B. GET REQUEST ROUTER
     # --------------------------------------------------------
@@ -524,6 +649,112 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import urlsplit
 
         path = urlsplit(self.path).path
+
+        # ====================================================
+        # INSTAGRAM UNIFIED LOGIN (USER-INITIATED OAUTH)
+        # ====================================================
+        if path == "/auth/instagram/start":
+            login_url = os.getenv("META_LOGIN_URL", "").strip()
+            secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
+            if not login_url or len(secret) < 32:
+                return self.respond({
+                    "error": "Instagram OAuth is not configured",
+                    "required": ["META_LOGIN_URL", "CRESCENDO_SESSION_SECRET"],
+                }, 503)
+
+            parsed = urllib.parse.urlsplit(login_url)
+            if parsed.scheme != "https" or parsed.hostname not in (
+                "www.facebook.com", "facebook.com"
+            ) or parsed.path != "/dialog/oauth":
+                return self.respond({"error": "Invalid Meta login configuration"}, 503)
+
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            app_id = os.getenv("META_APP_ID", "")
+            if not app_id or query.get("client_id", [None])[0] != app_id:
+                return self.respond({"error": "Meta app ID mismatch"}, 503)
+
+            nonce = secrets.token_urlsafe(32)
+            signed = oauth_sign({"state": nonce, "iat": int(time.time())}, secret)
+            query["state"] = [nonce]
+            query["redirect_uri"] = [OAUTH_CALLBACK]
+            destination = urllib.parse.urlunsplit((
+                parsed.scheme, parsed.netloc, parsed.path,
+                urllib.parse.urlencode(query, doseq=True), "",
+            ))
+            return self.redirect(destination, cookies=[
+                self.oauth_cookie(OAUTH_STATE_COOKIE, signed, 600)
+            ])
+
+        if path == "/auth/instagram/callback":
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query
+            )
+            secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
+            signed = cookie_value(self.headers.get("Cookie"), OAUTH_STATE_COOKIE)
+            state = oauth_unsign(signed, secret, 600) if secret and signed else None
+            supplied_state = query.get("state", [None])[0]
+            clear_state = self.oauth_clear_cookie(OAUTH_STATE_COOKIE)
+
+            if not state or not supplied_state or not hmac.compare_digest(
+                str(state.get("state", "")), supplied_state
+            ):
+                return self.respond({"error": "Invalid or expired OAuth state"}, 400)
+
+            if "error" in query:
+                return self.redirect("/?instagram=cancelled", [clear_state])
+
+            code = query.get("code", [None])[0]
+            app_id = os.getenv("META_APP_ID", "")
+            app_secret = os.getenv("META_APP_SECRET", "")
+            if not code or not app_id or not app_secret:
+                return self.respond({"error": "Missing authorization code or configuration"}, 400)
+
+            try:
+                exchange_url = (
+                    "https://graph.facebook.com/v24.0/oauth/access_token?"
+                    + urllib.parse.urlencode({
+                        "client_id": app_id,
+                        "client_secret": app_secret,
+                        "redirect_uri": OAUTH_CALLBACK,
+                        "code": code,
+                    })
+                )
+                exchange = meta_oauth_json(exchange_url)
+                user_token = exchange.get("access_token")
+                if not isinstance(user_token, str) or not user_token:
+                    raise RuntimeError("No user token returned")
+                accounts = discover_instagram_accounts(user_token)
+            except RuntimeError:
+                return self.redirect("/?instagram=error", [clear_state])
+
+            # Only persist a short-lived, signed RESULT, never the access token.
+            # No public verified badge is awarded by this proof of concept.
+            result = {
+                "iat": int(time.time()),
+                "accounts": accounts[:20],
+                "status": "connected_test" if accounts else "no_accounts",
+                "artist_verified": False,
+            }
+            result_cookie = oauth_sign(result, secret)
+            print("[IG OAUTH] Login callback completed; accounts:", len(accounts), flush=True)
+            return self.redirect("/?instagram=connected" if accounts else "/?instagram=no_accounts", [
+                clear_state,
+                self.oauth_cookie(OAUTH_RESULT_COOKIE, result_cookie, 1800),
+            ])
+
+        if path == "/api/instagram/session":
+            secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
+            signed = cookie_value(self.headers.get("Cookie"), OAUTH_RESULT_COOKIE)
+            result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+            if not result:
+                return self.respond({"connected": False, "artist_verified": False})
+            return self.respond({
+                "connected": result.get("status") == "connected_test",
+                "status": result.get("status"),
+                "accounts": result.get("accounts", []),
+                "artist_verified": False,
+                "note": "OAuth test only; no artist identity has been verified",
+            })
 
         # ====================================================
         # HEALTH CHECK
