@@ -486,6 +486,10 @@ OAUTH_CALLBACK = (
 )
 OAUTH_STATE_COOKIE = "crescendo_ig_oauth_state"
 OAUTH_RESULT_COOKIE = "crescendo_ig_oauth_result"
+# Sandbox-only mapping. Never use this as evidence of real artist identity.
+TEST_ARTIST_NAME = "Mac Ayres"
+TEST_ARTIST_IG_ID = "17841457229549813"
+
 
 
 def oauth_sign(payload, secret):
@@ -697,6 +701,46 @@ class Handler(BaseHTTPRequestHandler):
     # 8B. GET REQUEST ROUTER
     # --------------------------------------------------------
 
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path != "/api/artist/claim-test":
+            return self.respond({"error": "Not found"}, 404)
+        # Sandbox claim must be explicitly enabled by the operator.
+        if os.getenv("CRESCENDO_ENABLE_TEST_CLAIMS", "").lower() != "true":
+            return self.respond({"error": "Test claims are disabled"}, 403)
+        expected_origin = "https://crescendocoin-production.up.railway.app"
+        if self.headers.get("Origin") != expected_origin:
+            return self.respond({"error": "Invalid request origin"}, 403)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return self.respond({"error": "Invalid request length"}, 400)
+        if not 0 < length <= 2048:
+            return self.respond({"error": "Invalid request length"}, 400)
+        data = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+        nonce = data.get("nonce", [""])[0]
+        secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
+        signed = cookie_value(self.headers.get("Cookie"), OAUTH_RESULT_COOKIE)
+        result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+        if not result or result.get("status") != "connected_test":
+            return self.respond({"error": "Instagram login required"}, 401)
+        expected_nonce = result.get("claim_nonce", "")
+        if not nonce or not expected_nonce or not hmac.compare_digest(nonce, expected_nonce):
+            return self.respond({"error": "Invalid claim confirmation"}, 403)
+        matched = any(
+            isinstance(a, dict) and str(a.get("id")) == TEST_ARTIST_IG_ID
+            and str(a.get("username", "")).lower() == "crescendo_coin"
+            for a in result.get("accounts", [])
+        )
+        if not matched:
+            return self.respond({"error": "Test account mismatch"}, 403)
+        result["test_claimed"] = True
+        result["claim_nonce"] = ""  # one-time confirmation
+        remaining = max(1, 1800 - int(time.time() - int(result["iat"])))
+        return self.redirect("/artist/verify", cookies=[
+            self.oauth_cookie(OAUTH_RESULT_COOKIE, oauth_sign(result, secret), remaining)
+        ])
+
     def do_GET(self):
 
         from urllib.parse import urlsplit
@@ -788,6 +832,8 @@ class Handler(BaseHTTPRequestHandler):
                 "diagnostics": diagnostics,
                 "status": "connected_test" if accounts else "no_accounts",
                 "artist_verified": False,
+                "claim_nonce": secrets.token_urlsafe(24),
+                "test_claimed": False,
             }
             result_cookie = oauth_sign(result, secret)
             print("[IG OAUTH] Login callback completed; accounts:", len(accounts), flush=True)
@@ -808,7 +854,62 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": result.get("accounts", []),
                 "diagnostics": result.get("diagnostics", []),
                 "artist_verified": False,
+                "test_claimed": bool(result.get("test_claimed")),
                 "note": "OAuth test only; no artist identity has been verified",
+            })
+
+        # ====================================================
+        # ARTIST CLAIM — SANDBOX ONLY
+        # ====================================================
+        if path == "/artist/verify":
+            secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
+            signed = cookie_value(self.headers.get("Cookie"), OAUTH_RESULT_COOKIE)
+            result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+            accounts = result.get("accounts", []) if result else []
+            matched = any(
+                isinstance(a, dict) and str(a.get("id")) == TEST_ARTIST_IG_ID
+                and str(a.get("username", "")).lower() == "crescendo_coin"
+                for a in accounts
+            )
+            nonce = result.get("claim_nonce", "") if result else ""
+            import html
+            message = (
+                "Connected account: @crescendo_coin" if matched
+                else "Connect @crescendo_coin through Meta first."
+            )
+            action = (
+                '<form method="POST" action="/api/artist/claim-test">'
+                '<input type="hidden" name="nonce" value="' + html.escape(nonce, quote=True) + '">'
+                '<button type="submit">Confirm test claim</button></form>'
+                if matched and nonce and not result.get("test_claimed") and os.getenv("CRESCENDO_ENABLE_TEST_CLAIMS", "").lower() == "true" else
+                ('<p>Test claim confirmed for this session.</p>' if matched and result and result.get("test_claimed") else
+                 '<a href="/auth/instagram/start">Connect Instagram</a>')
+            )
+            page = ("""<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crescendo — Artist claim test</title>
+<style>body{font:16px system-ui;background:#0d0b19;color:#f4efff;max-width:620px;
+margin:10vh auto;padding:24px}main{background:#1b1630;padding:30px;border-radius:18px}
+button,a{background:#a78bfa;color:#100a20;border:0;border-radius:10px;
+padding:12px 16px;font-weight:700;cursor:pointer;display:inline-block;text-decoration:none}
+p{line-height:1.6;color:#d2c8e8}.note{font-size:14px}</style>
+<main><h1>Mac Ayres — test profile claim</h1><p>""" + html.escape(message) + """</p>
+<p class="note">This is a sandbox account association, not verification of Mac Ayres'
+identity or authorization. No public verified badge is issued.</p>""" + action +
+"""<p><a href="/">Back to leaderboard</a></p></main></html>""")
+            return self.respond(page.encode("utf-8"), content_type="text/html; charset=utf-8")
+
+        if path == "/api/artist/claim-status":
+            secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
+            signed = cookie_value(self.headers.get("Cookie"), OAUTH_RESULT_COOKIE)
+            result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+            return self.respond({
+                "artist": TEST_ARTIST_NAME,
+                "status": "test_claimed" if result and result.get("test_claimed") else "unclaimed",
+                "instagram_account": "crescendo_coin" if result and result.get("test_claimed") else None,
+                "artist_verified": False,
+                "public_badge": False,
+                "persistent": False,
             })
 
         # ====================================================
