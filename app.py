@@ -99,18 +99,14 @@ MAC = [
 # ============================================================
 
 def fetch_json(url, token=None, data=None, basic=None):
-    headers = {
-        "Accept": "application/json",
-    }
+    headers = {"Accept": "application/json"}
 
     if token:
         headers["Authorization"] = "Bearer " + token
 
     if basic:
         headers["Authorization"] = "Basic " + basic
-        headers["Content-Type"] = (
-            "application/x-www-form-urlencoded"
-        )
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
 
     request = urllib.request.Request(
         url,
@@ -120,50 +116,14 @@ def fetch_json(url, token=None, data=None, basic=None):
     )
 
     try:
-      
-                with urllib.request.urlopen(
-                    request, timeout=25
-                ) as response:
-
-                    http_status = response.status
-                    content_type = response.headers.get(
-                        "Content-Type", ""
-                    )
-
-                    raw_body = response.read()
-
-                    print(
-                        "[META RAW RESPONSE]",
-                        "status:", http_status,
-                        "content_type:", content_type,
-                        "body_length:", len(raw_body),
-                        flush=True,
-                    )
-
-                    result = json.loads(raw_body)
-
-                    print(
-                        "[META PARSED RESPONSE]",
-                        "type:", type(result).__name__,
-                        "is_empty_list": (
-                            isinstance(result, list)
-                            and len(result) == 0
-                        ),
-                        flush=True,
-                    )
-
+        with urllib.request.urlopen(request, timeout=25) as response:
+            return json.load(response)
 
     except urllib.error.HTTPError as exc:
-        raw_body = exc.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-
-        # Parse only safe diagnostic fields.
+        raw_body = exc.read().decode("utf-8", errors="replace")
         try:
             payload = json.loads(raw_body)
             error = payload.get("error", {})
-
             if isinstance(error, dict):
                 details = {
                     "message": error.get("message"),
@@ -172,30 +132,17 @@ def fetch_json(url, token=None, data=None, basic=None):
                     "subcode": error.get("error_subcode"),
                 }
             else:
-                details = {
-                    "message": "Unexpected API error format"
-                }
-
+                details = {"message": "Unexpected API error format"}
         except (ValueError, AttributeError):
-            details = {
-                "message": "Non-JSON API error response"
-            }
+            details = {"message": "Non-JSON API error response"}
 
-        # Never print request URLs, headers,
-        # credentials, or access tokens.
         print(
             "[API HTTP ERROR]",
-            "status:",
-            exc.code,
-            "details:",
-            details,
+            "status:", exc.code,
+            "details:", details,
             flush=True,
         )
-
-        raise RuntimeError(
-            "Upstream API returned HTTP "
-            + str(exc.code)
-        ) from None
+        raise RuntimeError("Upstream API returned HTTP " + str(exc.code)) from None
 
     except urllib.error.URLError as exc:
         print(
@@ -203,10 +150,7 @@ def fetch_json(url, token=None, data=None, basic=None):
             type(exc.reason).__name__,
             flush=True,
         )
-
-        raise RuntimeError(
-            "Unable to reach upstream API"
-        ) from None
+        raise RuntimeError("Unable to reach upstream API") from None
 
 
 def access_token(client_id, client_secret):
@@ -708,7 +652,21 @@ class Handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(
                     request, timeout=25
                 ) as response:
-                    result = json.load(response)
+                    raw_body = response.read()
+                    print(
+                        "[META RAW RESPONSE]",
+                        "status:", response.status,
+                        "content_type:", response.headers.get("Content-Type", ""),
+                        "body_length:", len(raw_body),
+                        flush=True,
+                    )
+                    result = json.loads(raw_body)
+                    print(
+                        "[META PARSED RESPONSE]",
+                        "type:", type(result).__name__,
+                        "is_empty_list:", isinstance(result, list) and not result,
+                        flush=True,
+                    )
 
              
                 # ============================================
