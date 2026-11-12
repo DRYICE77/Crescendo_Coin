@@ -8,6 +8,7 @@ Artist photos and Spotify streaming data provided by Soundcharts.
 import argparse
 import base64
 import getpass
+import html
 import hashlib
 import hmac
 import secrets
@@ -697,6 +698,21 @@ def db_initialize():
                 CREATE UNIQUE INDEX IF NOT EXISTS crescendo_one_approved_claim_per_artist
                 ON crescendo_claim_requests (artist_id) WHERE status = 'approved'
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crescendo_admin_audit (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    artist_id BIGINT,
+                    claim_id BIGINT,
+                    details TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS crescendo_one_artist_per_approved_ig
+                ON crescendo_claim_requests (instagram_account_id)
+                WHERE status = 'approved'
+            """)
             # Seed only missing records; preserve edits made by the team.
             for song in SONGS:
                 cur.execute("""
@@ -831,6 +847,150 @@ def db_artist_songs():
             } for row in cur.fetchall()]
 
 # ============================================================
+# 7D. TEAM ARTIST MANAGER
+# ============================================================
+
+def admin_rows():
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, artist_name, COALESCE(spotify_artist_id, ''),
+                       spotify_track_id, COALESCE(song_title, ''),
+                       COALESCE(instagram_username, ''), active
+                FROM crescendo_artists ORDER BY id
+            """)
+            artists = cur.fetchall()
+            cur.execute("""
+                SELECT c.id, c.artist_id, a.artist_name, c.instagram_username,
+                       c.instagram_account_id, c.status, c.created_at
+                FROM crescendo_claim_requests c
+                JOIN crescendo_artists a ON a.id = c.artist_id
+                ORDER BY CASE c.status WHEN 'pending' THEN 0 ELSE 1 END,
+                         c.created_at DESC LIMIT 150
+            """)
+            claims = cur.fetchall()
+    return artists, claims
+
+
+def admin_save_artist(fields):
+    artist_id = int(fields.get('artist_id', '0') or '0')
+    name = fields.get('artist_name', '').strip()
+    track = fields.get('spotify_track_id', '').strip()
+    spotify = fields.get('spotify_artist_id', '').strip() or None
+    song = fields.get('song_title', '').strip() or None
+    instagram = fields.get('instagram_username', '').strip().lstrip('@') or None
+    active = fields.get('active') == 'true'
+    if not name or len(name) > 180 or not track or len(track) > 100:
+        raise ValueError('Artist name and Spotify track ID are required')
+    if spotify and len(spotify) > 100 or instagram and len(instagram) > 100:
+        raise ValueError('Invalid field length')
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            if artist_id:
+                cur.execute("""
+                    UPDATE crescendo_artists SET artist_name=%s, spotify_artist_id=%s,
+                        spotify_track_id=%s, song_title=%s, instagram_username=%s,
+                        active=%s, updated_at=NOW() WHERE id=%s RETURNING id
+                """, (name, spotify, track, song, instagram, active, artist_id))
+            else:
+                cur.execute("""
+                    INSERT INTO crescendo_artists
+                    (artist_name, spotify_artist_id, spotify_track_id, song_title,
+                     instagram_username, active)
+                    VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+                """, (name, spotify, track, song, instagram, active))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError('Artist not found')
+            cur.execute("INSERT INTO crescendo_admin_audit (action,artist_id) VALUES (%s,%s)",
+                        ('artist_updated' if artist_id else 'artist_created', row[0]))
+
+
+def admin_review_claim(claim_id, decision):
+    if decision not in ('approved', 'rejected', 'revoked'):
+        raise ValueError('Invalid decision')
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.artist_id, c.instagram_account_id, c.status,
+                       a.active, a.artist_name
+                FROM crescendo_claim_requests c
+                JOIN crescendo_artists a ON a.id=c.artist_id
+                WHERE c.id=%s FOR UPDATE OF c
+            """, (claim_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError('Claim not found')
+            artist_id, ig_id, previous, active, artist_name = row
+            if decision == 'approved':
+                if previous != 'pending' or not active:
+                    raise ValueError('Only pending claims for active artists can be approved')
+                if ig_id == TEST_ARTIST_IG_ID:
+                    raise ValueError('Sandbox @crescendo_coin cannot receive public verification')
+                # The team must verify authorization independently before approval.
+            elif decision == 'rejected' and previous != 'pending':
+                raise ValueError('Only pending claims can be rejected')
+            elif decision == 'revoked' and previous != 'approved':
+                raise ValueError('Only approved claims can be revoked')
+            cur.execute("""
+                UPDATE crescendo_claim_requests SET status=%s, updated_at=NOW()
+                WHERE id=%s
+            """, (decision, claim_id))
+            cur.execute("""
+                INSERT INTO crescendo_admin_audit
+                    (action,artist_id,claim_id,details) VALUES (%s,%s,%s,%s)
+            """, ('claim_' + decision, artist_id, claim_id, previous))
+
+
+def admin_page(artists, claims, notice=''):
+    e = lambda v: html.escape(str(v), quote=True)
+    style = """<style>body{background:#0c0917;color:#f4efff;font:16px system-ui;margin:0}
+    main{max-width:1150px;margin:35px auto;padding:20px}h1,h2{color:#d6bcff}
+    section{background:#1d1730;border:1px solid #43345f;border-radius:15px;padding:20px;margin:20px 0}
+    table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #403550;text-align:left}
+    input{background:#110e1e;color:white;border:1px solid #67558b;border-radius:6px;padding:9px;max-width:100%}
+    button{background:#ac89fa;border:0;border-radius:7px;padding:9px 13px;cursor:pointer;font-weight:700}
+    form{display:inline-block;margin:4px}.fields{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    a{color:#c7a7ff}.muted{color:#c0b3d3}small{color:#c0b3d3}</style>"""
+    out = ['<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+           '<title>Crescendo Artist Manager</title>', style, '</head><body><main>',
+           '<h1>Crescendo · Artist Manager</h1><p class="muted">Private team console · Changes are stored in PostgreSQL.</p>']
+    if notice: out.append('<p>' + e(notice) + '</p>')
+    out.append('<section><h2>Add artist</h2><form method="post" action="/admin/artists/save"><div class="fields">'
+               '<input name="artist_name" placeholder="Artist name" required>'
+               '<input name="spotify_artist_id" placeholder="Spotify artist ID">'
+               '<input name="spotify_track_id" placeholder="Spotify track ID" required>'
+               '<input name="song_title" placeholder="Song title">'
+               '<input name="instagram_username" placeholder="Expected Instagram (optional)">'
+               '<input type="hidden" name="active" value="true"><button>Add artist</button></div></form></section>')
+    out.append('<section><h2>Artist roster</h2><p class="muted">Edit any field and save. Uncheck Active to hide an artist from the leaderboard.</p>')
+    for aid,name,spotify,track,song,ig,active in artists:
+        out.append('<form method="post" action="/admin/artists/save" style="display:block;border-top:1px solid #403550;padding:12px 0">'
+                   '<div class="fields"><input type="hidden" name="artist_id" value="'+e(aid)+'">'
+                   '<input aria-label="Artist name" name="artist_name" value="'+e(name)+'" required>'
+                   '<input aria-label="Spotify artist ID" name="spotify_artist_id" value="'+e(spotify)+'" placeholder="Spotify artist ID">'
+                   '<input aria-label="Spotify track ID" name="spotify_track_id" value="'+e(track)+'" required>'
+                   '<input aria-label="Song title" name="song_title" value="'+e(song)+'" placeholder="Song title">'
+                   '<input aria-label="Instagram" name="instagram_username" value="'+e(ig)+'" placeholder="Instagram">'
+                   '<label><input type="checkbox" name="active" value="true"'+(' checked' if active else '')+'> Active</label>'
+                   '<button>Save #'+e(aid)+'</button></div></form>')
+    out.append('</section><section><h2>Instagram claim requests</h2><p class="muted">Approve only after independent confirmation of artist/management authorization. Sandbox accounts cannot be approved.</p>'
+               '<div style="overflow-x:auto"><table><tr><th>Artist</th><th>Instagram</th><th>Status</th><th>Submitted</th><th>Actions</th></tr>')
+    for cid,aid,name,ig,igid,status,created in claims:
+        out.append('<tr><td>'+e(name)+' (#'+e(aid)+')</td><td>@'+e(ig)+'<br><small>ID '+e(igid)+'</small></td>'
+                   '<td>'+e(status)+'</td><td>'+e(created)+'</td><td>')
+        actions = ('approved','rejected') if status=='pending' else (('revoked',) if status=='approved' else ())
+        for action in actions:
+            out.append('<form method="post" action="/admin/claims/review">'
+                       '<input type="hidden" name="claim_id" value="'+e(cid)+'">'
+                       '<input type="hidden" name="decision" value="'+e(action)+'">'
+                       '<button>'+e(action.title())+'</button></form>')
+        out.append('</td></tr>')
+    out.append('</table></div></section><p><a href="/">Back to leaderboard</a></p></main></body></html>')
+    return ''.join(out).encode('utf-8')
+
+
+# ============================================================
 # 8. HTTP SERVER
 # ============================================================
 
@@ -906,8 +1066,63 @@ class Handler(BaseHTTPRequestHandler):
     # 8B. GET REQUEST ROUTER
     # --------------------------------------------------------
 
+    def admin_authorized(self):
+        expected = os.getenv('CRESCENDO_ADMIN_PASSWORD', '')
+        if len(expected) < 24:
+            return False
+        header = self.headers.get('Authorization', '')
+        if not header.startswith('Basic '):
+            return False
+        try:
+            decoded = base64.b64decode(header[6:], validate=True).decode('utf-8')
+            username, password = decoded.split(':', 1)
+            return (hmac.compare_digest(username, 'crescendo-admin') and
+                    hmac.compare_digest(password, expected))
+        except (ValueError, UnicodeDecodeError):
+            return False
+
+    def admin_challenge(self):
+        data = b'Administrator login required'
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="Crescendo Team"')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def admin_form(self):
+        origin = os.getenv('CRESCENDO_PUBLIC_URL',
+                           'https://crescendocoin-production.up.railway.app').rstrip('/')
+        if self.headers.get('Origin') != origin:
+            raise PermissionError('Invalid request origin')
+        if self.headers.get('Content-Type', '').split(';')[0].strip() != 'application/x-www-form-urlencoded':
+            raise ValueError('Invalid content type')
+        size = int(self.headers.get('Content-Length', '0'))
+        if not 0 < size <= 8192:
+            raise ValueError('Invalid form size')
+        parsed = urllib.parse.parse_qs(self.rfile.read(size).decode('utf-8'), keep_blank_values=True)
+        return {k: v[0] for k,v in parsed.items()}
+
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path in ('/admin/artists/save', '/admin/claims/review'):
+            if not self.admin_authorized():
+                return self.admin_challenge()
+            try:
+                fields = self.admin_form()
+                if path == '/admin/artists/save':
+                    admin_save_artist(fields)
+                else:
+                    admin_review_claim(int(fields.get('claim_id', '0')), fields.get('decision', ''))
+            except PermissionError:
+                return self.respond({'error': 'Invalid origin'}, 403)
+            except ValueError as exc:
+                return self.respond({'error': str(exc)}, 400)
+            except Exception as exc:
+                print('[ADMIN] Write failed:', type(exc).__name__, flush=True)
+                return self.respond({'error': 'Unable to save; check constraints and logs'}, 409)
+            return self.redirect('/admin/artists?updated=1')
         if path == "/api/artist/claim":
             origin = os.getenv('CRESCENDO_PUBLIC_URL', 'https://crescendocoin-production.up.railway.app').rstrip('/')
             if self.headers.get('Origin') != origin:
@@ -1000,6 +1215,17 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import urlsplit
 
         path = urlsplit(self.path).path
+
+        if path == '/admin/artists':
+            if not self.admin_authorized():
+                return self.admin_challenge()
+            try:
+                artists, claims = admin_rows()
+                content = admin_page(artists, claims)
+                return self.respond(content, content_type='text/html; charset=utf-8')
+            except Exception as exc:
+                print('[ADMIN] Read failed:', type(exc).__name__, flush=True)
+                return self.respond({'error': 'Database unavailable'}, 503)
 
         # ====================================================
         # INSTAGRAM UNIFIED LOGIN (USER-INITIATED OAUTH)
