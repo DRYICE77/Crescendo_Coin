@@ -491,6 +491,7 @@ OAUTH_CALLBACK = (
 )
 OAUTH_STATE_COOKIE = "crescendo_ig_oauth_state"
 OAUTH_RESULT_COOKIE = "crescendo_ig_oauth_result"
+CLAIM_INTENT_COOKIE = "crescendo_claim_intent"
 # Sandbox-only mapping. Never use this as evidence of real artist identity.
 TEST_ARTIST_NAME = "Mac Ayres"
 TEST_ARTIST_IG_ID = "17841457229549813"
@@ -679,6 +680,23 @@ def db_initialize():
                     UNIQUE (artist_id, instagram_account_id, claim_type)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crescendo_claim_requests (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    artist_id BIGINT NOT NULL REFERENCES crescendo_artists(id),
+                    instagram_account_id TEXT NOT NULL,
+                    instagram_username TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK
+                        (status IN ('pending', 'approved', 'rejected', 'revoked')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (artist_id, instagram_account_id)
+                )
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS crescendo_one_approved_claim_per_artist
+                ON crescendo_claim_requests (artist_id) WHERE status = 'approved'
+            """)
             # Seed only missing records; preserve edits made by the team.
             for song in SONGS:
                 cur.execute("""
@@ -725,6 +743,77 @@ def db_save_test_claim():
                 ON CONFLICT (artist_id, instagram_account_id, claim_type)
                 DO UPDATE SET status = 'test_claimed', updated_at = NOW()
             """, (artist[0], TEST_ARTIST_IG_ID, 'crescendo_coin'))
+
+
+def db_artist_by_id(artist_id):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, artist_name, instagram_account_id, instagram_username
+                FROM crescendo_artists WHERE id = %s AND active = TRUE
+            """, (artist_id,))
+            row = cur.fetchone()
+            return dict(zip(('id', 'artist', 'expected_ig_id', 'expected_ig_username'), row)) if row else None
+
+
+def db_artist_by_track(track_id):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM crescendo_artists WHERE spotify_track_id = %s AND active = TRUE", (track_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+
+def db_claim_status(artist_id):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status, instagram_username FROM crescendo_claim_requests
+                WHERE artist_id = %s AND status = 'approved' LIMIT 1
+            """, (artist_id,))
+            approved = cur.fetchone()
+            if approved:
+                return {'status': 'verified', 'verified': True, 'instagram_username': approved[1]}
+            cur.execute("""
+                SELECT status FROM crescendo_claim_requests
+                WHERE artist_id = %s AND status = 'pending' LIMIT 1
+            """, (artist_id,))
+            return {'status': 'pending_review' if cur.fetchone() else 'unclaimed', 'verified': False}
+
+
+def db_request_claim(artist_id, ig_id, username):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT artist_id FROM crescendo_claim_requests
+                WHERE instagram_account_id = %s AND status = 'approved'
+                  AND artist_id <> %s LIMIT 1
+            """, (ig_id, artist_id))
+            if cur.fetchone():
+                raise ValueError('Instagram account is already approved for another artist')
+            cur.execute("""
+                INSERT INTO crescendo_claim_requests
+                    (artist_id, instagram_account_id, instagram_username, status)
+                VALUES (%s, %s, %s, 'pending')
+                ON CONFLICT (artist_id, instagram_account_id)
+                DO UPDATE SET instagram_username = EXCLUDED.instagram_username,
+                  status = CASE WHEN crescendo_claim_requests.status = 'approved'
+                                THEN 'approved' ELSE 'pending' END,
+                  updated_at = NOW()
+            """, (artist_id, ig_id, username))
+
+
+def db_public_claims():
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.spotify_track_id, a.id,
+                    EXISTS (SELECT 1 FROM crescendo_claim_requests c
+                            WHERE c.artist_id = a.id AND c.status = 'approved')
+                FROM crescendo_artists a WHERE a.active = TRUE
+            """)
+            return {r[0]: {'artistId': r[1], 'artistVerified': bool(r[2])}
+                    for r in cur.fetchall()}
 
 
 def db_artist_songs():
@@ -819,6 +908,50 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/artist/claim":
+            origin = os.getenv('CRESCENDO_PUBLIC_URL', 'https://crescendocoin-production.up.railway.app').rstrip('/')
+            if self.headers.get('Origin') != origin:
+                return self.respond({'error': 'Invalid origin'}, 403)
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 2048:
+                    raise ValueError('Invalid length')
+                form = urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'))
+                artist_id = int(form.get('artist_id', ['0'])[0])
+                nonce = form.get('nonce', [''])[0]
+            except (ValueError, UnicodeDecodeError):
+                return self.respond({'error': 'Invalid request'}, 400)
+            secret = os.getenv('CRESCENDO_SESSION_SECRET', '')
+            signed = cookie_value(self.headers.get('Cookie'), OAUTH_RESULT_COOKIE)
+            result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+            if not result or result.get('status') != 'connected_test' or result.get('artist_id') != artist_id:
+                return self.respond({'error': 'Complete Instagram login for this artist first'}, 401)
+            if not nonce or not hmac.compare_digest(str(result.get('claim_nonce', '')), nonce):
+                return self.respond({'error': 'Invalid confirmation'}, 403)
+            try:
+                artist = db_artist_by_id(artist_id)
+                if not artist:
+                    return self.respond({'error': 'Artist not found'}, 404)
+                accounts = [a for a in result.get('accounts', []) if isinstance(a, dict)
+                            and str(a.get('id', '')).isdecimal() and a.get('username')]
+                # Only accept a single, unambiguous Instagram identity.
+                if len(accounts) != 1:
+                    return self.respond({'error': 'Select a single Instagram account before claiming'}, 409)
+                account = accounts[0]
+                expected_id = artist.get('expected_ig_id')
+                if expected_id and str(account['id']) != str(expected_id):
+                    return self.respond({'error': 'Connected Instagram does not match artist record'}, 403)
+                db_request_claim(artist_id, str(account['id']), str(account['username']))
+            except ValueError as exc:
+                return self.respond({'error': str(exc)}, 409)
+            except Exception as exc:
+                print('[CRESCENDO DB] Claim request failed:', type(exc).__name__, flush=True)
+                return self.respond({'error': 'Unable to save claim'}, 503)
+            result['claim_nonce'] = ''
+            remaining = max(1, 1800 - int(time.time() - int(result['iat'])))
+            return self.redirect('/artist/claim?artist_id=' + str(artist_id) + '&submitted=1', cookies=[
+                self.oauth_cookie(OAUTH_RESULT_COOKIE, oauth_sign(result, secret), remaining)
+            ])
         if path != "/api/artist/claim-test":
             return self.respond({"error": "Not found"}, 404)
         # Sandbox claim must be explicitly enabled by the operator.
@@ -871,6 +1004,60 @@ class Handler(BaseHTTPRequestHandler):
         # ====================================================
         # INSTAGRAM UNIFIED LOGIN (USER-INITIATED OAUTH)
         # ====================================================
+        if path == '/api/artists/claim-status':
+            try:
+                artist_id = int(urllib.parse.parse_qs(urlsplit(self.path).query).get('artist_id', ['0'])[0])
+                artist = db_artist_by_id(artist_id)
+                if not artist:
+                    return self.respond({'error': 'Artist not found'}, 404)
+                return self.respond({'artist_id': artist_id, 'artist': artist['artist'], **db_claim_status(artist_id)})
+            except ValueError:
+                return self.respond({'error': 'Invalid artist ID'}, 400)
+            except Exception as exc:
+                print('[CRESCENDO DB] Status failure:', type(exc).__name__, flush=True)
+                return self.respond({'error': 'Database unavailable'}, 503)
+
+        if path == '/artist/claim':
+            import html
+            try:
+                artist_id = int(urllib.parse.parse_qs(urlsplit(self.path).query).get('artist_id', ['0'])[0])
+                artist = db_artist_by_id(artist_id)
+                if not artist:
+                    return self.respond({'error': 'Artist not found'}, 404)
+                status = db_claim_status(artist_id)
+            except (ValueError, TypeError):
+                return self.respond({'error': 'Invalid artist ID'}, 400)
+            except Exception:
+                return self.respond({'error': 'Database unavailable'}, 503)
+            secret = os.getenv('CRESCENDO_SESSION_SECRET', '')
+            signed = cookie_value(self.headers.get('Cookie'), OAUTH_RESULT_COOKIE)
+            result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+            matching_session = result and result.get('artist_id') == artist_id and result.get('status') == 'connected_test'
+            accounts = result.get('accounts', []) if matching_session else []
+            name = html.escape(artist['artist'])
+            if status['verified']:
+                action = '<p>This artist has an approved claim.</p>'
+            elif matching_session and len(accounts) == 1 and result.get('claim_nonce'):
+                username = html.escape(str(accounts[0].get('username', 'unknown')))
+                nonce = html.escape(str(result['claim_nonce']), quote=True)
+                action = (f'<p>Connected as @{username}</p><form method="POST" action="/api/artist/claim">'
+                          f'<input type="hidden" name="artist_id" value="{artist_id}">'
+                          f'<input type="hidden" name="nonce" value="{nonce}">'
+                          '<button type="submit">Submit claim for review</button></form>')
+            elif matching_session and len(accounts) != 1:
+                action = '<p>We could not identify one Instagram account. Please reconnect.</p>'
+                action += f'<a href="/auth/instagram/start?artist_id={artist_id}">Reconnect Instagram</a>'
+            elif status['status'] == 'pending_review':
+                action = '<p>A claim is pending team review.</p>'
+            else:
+                action = f'<a href="/auth/instagram/start?artist_id={artist_id}">Connect Instagram</a>'
+            if urllib.parse.parse_qs(urlsplit(self.path).query).get('submitted') == ['1']:
+                action = '<p>Claim saved! Our team must review it before a public badge is shown.</p>'
+            page = ("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Crescendo — Claim artist</title>"
+                    "<style>body{font:16px system-ui;background:#0d0b19;color:#f4efff;max-width:620px;margin:10vh auto;padding:24px}main{background:#1b1630;padding:30px;border-radius:18px}button,a{background:#a78bfa;color:#100a20;border:0;border-radius:10px;padding:12px 16px;font-weight:700;cursor:pointer;display:inline-block;text-decoration:none}p{line-height:1.6;color:#d2c8e8}</style>"
+                    "<main><h1>Claim " + name + "</h1><p>Connect an Instagram account to request this artist profile. Crescendo reviews identity and authorization before issuing a verified badge.</p>" + action + "<p><a href=\"/\">Back to leaderboard</a></p></main></html>")
+            return self.respond(page.encode('utf-8'), content_type='text/html; charset=utf-8')
+
         if path == "/auth/instagram/start":
             login_url = os.getenv("META_LOGIN_URL", "").strip()
             secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
@@ -892,7 +1079,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({"error": "Meta app ID mismatch"}, 503)
 
             nonce = secrets.token_urlsafe(32)
-            signed = oauth_sign({"state": nonce, "iat": int(time.time())}, secret)
+            raw_artist_id = urllib.parse.parse_qs(urlsplit(self.path).query).get('artist_id', [''])[0]
+            artist_id = None
+            if raw_artist_id:
+                try:
+                    artist_id = int(raw_artist_id)
+                    if not db_artist_by_id(artist_id):
+                        return self.respond({'error': 'Artist not found'}, 404)
+                except ValueError:
+                    return self.respond({'error': 'Invalid artist ID'}, 400)
+                except Exception:
+                    return self.respond({'error': 'Database unavailable'}, 503)
+            signed = oauth_sign({"state": nonce, "iat": int(time.time()), 'artist_id': artist_id}, secret)
             query["state"] = [nonce]
             query["redirect_uri"] = [OAUTH_CALLBACK]
             destination = urllib.parse.urlunsplit((
@@ -955,10 +1153,12 @@ class Handler(BaseHTTPRequestHandler):
                 "artist_verified": False,
                 "claim_nonce": secrets.token_urlsafe(24),
                 "test_claimed": False,
+                "artist_id": state.get('artist_id'),
             }
             result_cookie = oauth_sign(result, secret)
             print("[IG OAUTH] Login callback completed; accounts:", len(accounts), flush=True)
-            return self.redirect("/?instagram=connected" if accounts else "/?instagram=no_accounts", [
+            target = ('/artist/claim?artist_id=' + str(state['artist_id'])) if state.get('artist_id') else ('/?instagram=connected' if accounts else '/?instagram=no_accounts')
+            return self.redirect(target, [
                 clear_state,
                 self.oauth_cookie(OAUTH_RESULT_COOKIE, result_cookie, 1800),
             ])
@@ -1006,7 +1206,7 @@ class Handler(BaseHTTPRequestHandler):
                 ('<p>Test claim confirmed for this session.</p>' if matched and result and result.get("test_claimed") else
                  '<a href="/auth/instagram/start">Connect Instagram</a>')
             )
-            page = ("""<!doctype html><html lang="en"><meta charset="utf-8">
+            page = ("""<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Crescendo — Artist claim test</title>
 <style>body{font:16px system-ui;background:#0d0b19;color:#f4efff;max-width:620px;
@@ -1017,7 +1217,7 @@ p{line-height:1.6;color:#d2c8e8}.note{font-size:14px}</style>
 <main><h1>Mac Ayres — test profile claim</h1><p>""" + html.escape(message) + """</p>
 <p class="note">This is a sandbox account association, not verification of Mac Ayres'
 identity or authorization. No public verified badge is issued.</p>""" + action +
-"""<p><a href="/">Back to leaderboard</a></p></main></html>""")
+"""<p><a href=\"/\">Back to leaderboard</a></p></main></html>""")
             return self.respond(page.encode("utf-8"), content_type="text/html; charset=utf-8")
 
         if path == "/api/artist/claim-status":
@@ -1465,6 +1665,14 @@ identity or authorization. No public verified badge is issued.</p>""" + action +
         # ====================================================
 
         assign_scores(entries)
+        try:
+            public_claims = db_public_claims()
+            for entry in entries:
+                entry.update(public_claims.get(entry.get('trackId'), {'artistVerified': False}))
+        except Exception as exc:
+            print('[CRESCENDO DB] Public claims read failed:', type(exc).__name__, flush=True)
+            for entry in entries:
+                entry['artistVerified'] = False
 
         entries.sort(
             key=lambda r: (
