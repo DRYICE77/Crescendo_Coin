@@ -1,7 +1,7 @@
 
 """Crescendo Coin leaderboard proof of concept.
 
-Python standard library only.
+Python standard library plus psycopg for PostgreSQL persistence.
 Artist photos and Spotify streaming data provided by Soundcharts.
 """
 
@@ -21,6 +21,11 @@ import urllib.request
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 
 # ============================================================
@@ -625,6 +630,117 @@ def discover_instagram_accounts(access_token):
     return accounts, diagnostics
 
 
+
+# ============================================================
+# 7C. POSTGRESQL PERSISTENCE
+# ============================================================
+
+def db_connect():
+    """One short-lived connection per operation; no global shared cursor."""
+    if psycopg is None:
+        raise RuntimeError("psycopg is not installed; install requirements.txt")
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is missing")
+    return psycopg.connect(url, connect_timeout=8)
+
+
+def db_initialize():
+    """Idempotent initial schema. Never reset existing records on deploy."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crescendo_artists (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    artist_name TEXT NOT NULL UNIQUE,
+                    spotify_artist_id TEXT,
+                    spotify_track_id TEXT NOT NULL UNIQUE,
+                    soundcharts_artist_uuid TEXT,
+                    soundcharts_song_uuid TEXT,
+                    instagram_username TEXT,
+                    instagram_account_id TEXT,
+                    artist_image TEXT,
+                    song_title TEXT,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crescendo_artist_claims (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    artist_id BIGINT NOT NULL REFERENCES crescendo_artists(id),
+                    instagram_account_id TEXT NOT NULL,
+                    instagram_username TEXT NOT NULL,
+                    claim_type TEXT NOT NULL CHECK (claim_type IN ('sandbox', 'approved')),
+                    status TEXT NOT NULL CHECK (status IN ('test_claimed', 'approved', 'revoked')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (artist_id, instagram_account_id, claim_type)
+                )
+            """)
+            # Seed only missing records; preserve edits made by the team.
+            for song in SONGS:
+                cur.execute("""
+                    INSERT INTO crescendo_artists
+                    (artist_name, spotify_track_id, soundcharts_artist_uuid,
+                     soundcharts_song_uuid, artist_image, song_title)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (artist_name) DO NOTHING
+                """, (song['artist'], song['trackId'], song.get('artistUuid'),
+                      song.get('uuid'), song.get('artistImage'), song.get('song')))
+    print("[CRESCENDO DB] PostgreSQL connection successful", flush=True)
+    print("[CRESCENDO DB] Artist tables initialized", flush=True)
+
+
+def db_test_claim():
+    """Return the persisted sandbox association, if present."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.status, c.instagram_username, c.instagram_account_id
+                FROM crescendo_artist_claims c
+                JOIN crescendo_artists a ON a.id = c.artist_id
+                WHERE a.artist_name = %s AND c.claim_type = 'sandbox'
+                  AND c.status = 'test_claimed'
+                  AND c.instagram_account_id = %s
+                ORDER BY c.updated_at DESC LIMIT 1
+            """, (TEST_ARTIST_NAME, TEST_ARTIST_IG_ID))
+            return cur.fetchone()
+
+
+def db_save_test_claim():
+    """Persist the *sandbox* association only after the OAuth claim checks."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM crescendo_artists WHERE artist_name = %s",
+                        (TEST_ARTIST_NAME,))
+            artist = cur.fetchone()
+            if artist is None:
+                raise RuntimeError("Test artist not initialized")
+            cur.execute("""
+                INSERT INTO crescendo_artist_claims
+                  (artist_id, instagram_account_id, instagram_username, claim_type, status)
+                VALUES (%s, %s, %s, 'sandbox', 'test_claimed')
+                ON CONFLICT (artist_id, instagram_account_id, claim_type)
+                DO UPDATE SET status = 'test_claimed', updated_at = NOW()
+            """, (artist[0], TEST_ARTIST_IG_ID, 'crescendo_coin'))
+
+
+def db_artist_songs():
+    """The database is the artist roster; the frontend JSON shape stays stable."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT artist_name, song_title, spotify_track_id,
+                       soundcharts_song_uuid, soundcharts_artist_uuid, artist_image
+                FROM crescendo_artists WHERE active = TRUE ORDER BY id
+            """)
+            return [{
+                'artist': row[0], 'song': row[1], 'trackId': row[2],
+                'uuid': row[3], 'artistUuid': row[4], 'artistImage': row[5]
+            } for row in cur.fetchall()]
+
 # ============================================================
 # 8. HTTP SERVER
 # ============================================================
@@ -734,6 +850,11 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not matched:
             return self.respond({"error": "Test account mismatch"}, 403)
+        try:
+            db_save_test_claim()
+        except Exception as exc:
+            print("[CRESCENDO DB] Claim write failed:", type(exc).__name__, flush=True)
+            return self.respond({"error": "Could not persist sandbox claim"}, 503)
         result["test_claimed"] = True
         result["claim_nonce"] = ""  # one-time confirmation
         remaining = max(1, 1800 - int(time.time() - int(result["iat"])))
@@ -900,17 +1021,30 @@ identity or authorization. No public verified badge is issued.</p>""" + action +
             return self.respond(page.encode("utf-8"), content_type="text/html; charset=utf-8")
 
         if path == "/api/artist/claim-status":
-            secret = os.getenv("CRESCENDO_SESSION_SECRET", "")
-            signed = cookie_value(self.headers.get("Cookie"), OAUTH_RESULT_COOKIE)
-            result = oauth_unsign(signed, secret, 1800) if signed and secret else None
+            try:
+                claim = db_test_claim()
+            except Exception as exc:
+                print("[CRESCENDO DB] Claim read failed:", type(exc).__name__, flush=True)
+                return self.respond({"error": "Database unavailable"}, 503)
             return self.respond({
                 "artist": TEST_ARTIST_NAME,
-                "status": "test_claimed" if result and result.get("test_claimed") else "unclaimed",
-                "instagram_account": "crescendo_coin" if result and result.get("test_claimed") else None,
+                "status": "test_claimed" if claim else "unclaimed",
+                "instagram_account": claim[1] if claim else None,
                 "artist_verified": False,
                 "public_badge": False,
-                "persistent": False,
+                "persistent": bool(claim),
             })
+
+        if path == "/api/database/status":
+            try:
+                with db_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT COUNT(*) FROM crescendo_artists")
+                        count = cur.fetchone()[0]
+                return self.respond({"connected": True, "artist_count": count})
+            except Exception as exc:
+                print("[CRESCENDO DB] Health failure:", type(exc).__name__, flush=True)
+                return self.respond({"connected": False, "error": "Database unavailable"}, 503)
 
         # ====================================================
         # HEALTH CHECK
@@ -1257,7 +1391,13 @@ identity or authorization. No public verified badge is issued.</p>""" + action +
         # FETCH AND ANALYZE ARTISTS
         # ----------------------------------------------------
 
-        for song in SONGS:
+        try:
+            roster = db_artist_songs()
+        except Exception as exc:
+            print("[CRESCENDO DB] Roster read failed:", type(exc).__name__, flush=True)
+            return self.respond({"error": "Artist database unavailable"}, 503)
+
+        for song in roster:
 
             # DEMO MODE
 
@@ -1398,7 +1538,7 @@ if __name__ == "__main__":
     client_id = None
     client_secret = None
 
-    if args.live:
+    if args.live or os.getenv("CRESCENDO_MODE", "").lower() == "live":
 
         client_id = os.getenv(
             "SOUNDCHARTS_CLIENT_ID"
@@ -1448,12 +1588,16 @@ if __name__ == "__main__":
     # START HTTP SERVER
     # --------------------------------------------------------
 
+    # Fail deployment startup if the DB cannot be initialized.
+    # Railway should not serve a partially working persistent-claim backend.
+    db_initialize()
+
     server = ThreadingHTTPServer(
         (host, port),
         Handler,
     )
 
-    server.live = args.live
+    server.live = args.live or os.getenv("CRESCENDO_MODE", "").lower() == "live"
     server.client_id = client_id
     server.client_secret = client_secret
 
@@ -1474,7 +1618,7 @@ if __name__ == "__main__":
 
     print(
         "Mode:",
-        "LIVE" if args.live else "DEMO",
+        "LIVE" if server.live else "DEMO",
         flush=True,
     )
 
