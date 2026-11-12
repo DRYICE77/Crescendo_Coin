@@ -338,6 +338,16 @@
             background: #4b3b7e
         }
 
+
+        /* Artist claim controls */
+        .artist-details { min-width: 0; }
+        .artist-name-line { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+        .claim-button { display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:6px 10px; border:1px solid #8166ca; background:#30254e; border-radius:9px; color:#e7d8ff; font-size:11px; font-weight:800; text-decoration:none; white-space:nowrap; transition:background .15s,border-color .15s; }
+        .claim-button:hover, .claim-button:focus-visible { background:#57418d; border-color:#b89bff; }
+        .claim-status { display:inline-flex; align-items:center; border:1px solid #66518f; border-radius:8px; padding:5px 8px; color:#cdb9ff; background:#29223e; font-size:11px; font-weight:750; white-space:nowrap; }
+        .claim-status.verified { color:#8fe5bd; border-color:#3b8069; background:#16362e; }
+        .claim-note { color:#8d96b0; font-size:11px; margin-top:6px; }
+
         @media(max-width:750px) {
             .wrap {
                 padding: 18px 15px 45px
@@ -416,7 +426,7 @@
                     <thead>
                         <tr>
                             <th>Rank</th>
-                            <th>Artist / Song</th>
+                            <th>Artist / Song / Profile</th>
                             <th>Monthly streams</th>
                             <th>Weekly growth</th>
                             <th>Stream Score</th>
@@ -458,7 +468,60 @@
     <script>
         const fmt = n => n == null ? '—' : Math.round(n).toLocaleString('en-US'); const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         function photoUrl(value) { try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'assets.soundcharts.com' ? u.href : null } catch { return null } }
-        async function load() { document.getElementById('refresh').disabled = true; try { const res = await fetch('/api/leaderboard', { cache: 'no-store' }); const data = await res.json(); if (!res.ok) throw Error(data.error || 'Request failed'); document.getElementById('status').textContent = data.mode === 'live' ? 'Live Soundcharts API' : 'Demo · saved API snapshot'; document.getElementById('artistCount').textContent = data.artists.length; document.getElementById('rows').innerHTML = data.artists.map(a => { a.artistImage = photoUrl(a.artistImage); return `<tr><td><span class="rank">${a.rank ? '#' + a.rank : '—'}</span></td><td><div class="artist-cell"><span class="avatar" ${a.artistImage ? 'hidden' : ''}>${esc(a.artist.split(' ').map(w => w[0]).join('').slice(0, 2))}</span>${a.artistImage ? `<img class="artist-photo" src="${esc(a.artistImage)}" alt="${esc(a.artist)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true;this.previousElementSibling.hidden=false">` : ''}<div><div class="artist">${esc(a.artist)}</div><div class="song">${esc(a.song || 'Song pending lookup')}</div></div></div></td><td><strong>${fmt(a.monthly)}</strong><div class="small">${a.asOf ? 'As of ' + esc(a.asOf) : 'Awaiting data'}</div></td><td><strong class="${a.wow == null ? '' : a.wow >= 0 ? 'green' : 'red'}">${a.wow == null ? '—' : (a.wow > 0 ? '+' : '') + a.wow.toFixed(1) + '%'}</strong><div class="small">${a.weekly == null ? 'Pending' : fmt(a.weekly) + ' this week'}</div></td><td><span class="score">${a.score == null ? '—' : a.score + '/100'}</span></td><td><span class="coin">${a.reward == null ? 'Pending' : fmt(a.reward) + ' CRES'}</span><div class="small">${a.reward == null ? esc(a.note || 'Not enough data') : 'Illustrative weekly allocation'}</div></td></tr>` }).join(''); const warnings = data.artists.filter(a => a.status === 'error'); const warn = document.getElementById('warning'); warn.style.display = warnings.length ? 'block' : 'none'; warn.textContent = warnings.map(a => a.artist + ': ' + a.note).join(' · '); } catch (e) { const warn = document.getElementById('warning'); warn.style.display = 'block'; warn.textContent = 'Unable to load data: ' + e.message; document.getElementById('status').textContent = 'Connection issue'; } finally { document.getElementById('refresh').disabled = false; } }
+        // Artist claims are always initiated by the artist. A connected Instagram
+        // account is NOT proof of identity until the server approves the mapping.
+        function claimMarkup(a) {
+            const state = String(a.verification_status || a.claim_status || '').toLowerCase();
+            const verified = a.artist_verified === true && a.public_badge === true;
+            if (verified) return '<span class="claim-status verified" title="Artist identity approved">✓ Verified</span>';
+            if (state === 'pending' || state === 'pending_review') return '<span class="claim-status">⏳ Pending review</span>';
+            if (state === 'test_claimed') return '<span class="claim-status">✓ Test claimed</span>';
+            // The backend must validate the requested artist against its DB and
+            // securely bind it to the OAuth state before approving any claim.
+            const key = String(a.artistUuid || a.artist_id || a.artist || '');
+            const url = '/artist/verify?artist=' + encodeURIComponent(key);
+            return `<a class="claim-button" href="${esc(url)}" aria-label="Claim ${esc(a.artist)} profile with Instagram">◎ Claim profile</a>`;
+        }
+        async function load() {
+            const refresh = document.getElementById('refresh');
+            refresh.disabled = true;
+            try {
+                const res = await fetch('/api/leaderboard', { cache: 'no-store' });
+                const data = await res.json();
+                if (!res.ok) throw Error(data.error || 'Request failed');
+                document.getElementById('status').textContent = data.mode === 'live' ? 'Live Soundcharts API' : 'Demo · saved API snapshot';
+                document.getElementById('artistCount').textContent = data.artists.length;
+                document.getElementById('rows').innerHTML = data.artists.map(a => {
+                    const image = photoUrl(a.artistImage);
+                    const initials = esc(a.artist.split(' ').map(w => w[0]).join('').slice(0, 2));
+                    const name = esc(a.artist);
+                    return `<tr>
+                        <td><span class="rank">${a.rank ? '#' + a.rank : '—'}</span></td>
+                        <td><div class="artist-cell">
+                            <span class="avatar" ${image ? 'hidden' : ''}>${initials}</span>
+                            ${image ? `<img class="artist-photo" src="${esc(image)}" alt="${name}" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true;this.previousElementSibling.hidden=false">` : ''}
+                            <div class="artist-details">
+                                <div class="artist-name-line"><span class="artist">${name}</span>${claimMarkup(a)}</div>
+                                <div class="song">${esc(a.song || 'Song pending lookup')}</div>
+                            </div>
+                        </div></td>
+                        <td><strong>${fmt(a.monthly)}</strong><div class="small">${a.asOf ? 'As of ' + esc(a.asOf) : 'Awaiting data'}</div></td>
+                        <td><strong class="${a.wow == null ? '' : a.wow >= 0 ? 'green' : 'red'}">${a.wow == null ? '—' : (a.wow > 0 ? '+' : '') + a.wow.toFixed(1) + '%'}</strong><div class="small">${a.weekly == null ? 'Pending' : fmt(a.weekly) + ' this week'}</div></td>
+                        <td><span class="score">${a.score == null ? '—' : a.score + '/100'}</span></td>
+                        <td><span class="coin">${a.reward == null ? 'Pending' : fmt(a.reward) + ' CRES'}</span><div class="small">${a.reward == null ? esc(a.note || 'Not enough data') : 'Illustrative weekly allocation'}</div></td>
+                    </tr>`;
+                }).join('');
+                const warnings = data.artists.filter(a => a.status === 'error');
+                const warn = document.getElementById('warning');
+                warn.style.display = warnings.length ? 'block' : 'none';
+                warn.textContent = warnings.map(a => a.artist + ': ' + a.note).join(' · ');
+            } catch (e) {
+                const warn = document.getElementById('warning');
+                warn.style.display = 'block';
+                warn.textContent = 'Unable to load data: ' + e.message;
+                document.getElementById('status').textContent = 'Connection issue';
+            } finally { refresh.disabled = false; }
+        }
         load();
     </script>
 </body>
