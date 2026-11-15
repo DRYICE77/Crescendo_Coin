@@ -12,6 +12,8 @@ import html
 import hashlib
 import hmac
 import secrets
+import re
+import threading
 import time
 from http.cookies import SimpleCookie
 import json
@@ -647,6 +649,37 @@ def db_connect():
     return psycopg.connect(url, connect_timeout=8)
 
 
+EMAIL_SIGNUP_LOCK = threading.Lock()
+EMAIL_SIGNUP_ATTEMPTS = {}
+
+
+def email_signup_allowed(ip):
+    """Small per-process throttle; use an edge limiter for production scale."""
+    now = time.monotonic()
+    with EMAIL_SIGNUP_LOCK:
+        if len(EMAIL_SIGNUP_ATTEMPTS) > 2000:
+            EMAIL_SIGNUP_ATTEMPTS.clear()
+        attempts = [t for t in EMAIL_SIGNUP_ATTEMPTS.get(ip, []) if now - t < 3600]
+        if len(attempts) >= 12:
+            EMAIL_SIGNUP_ATTEMPTS[ip] = attempts
+            return False
+        attempts.append(now)
+        EMAIL_SIGNUP_ATTEMPTS[ip] = attempts
+        return True
+
+
+def db_email_signup(email):
+    """Store explicit consent without exposing whether an address exists."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO crescendo_email_subscribers
+                    (email, status, consent_at, consent_source)
+                VALUES (%s, 'subscribed', NOW(), 'website')
+                ON CONFLICT (email) DO NOTHING
+            """, (email,))
+
+
 def db_initialize():
     """Idempotent initial schema. Never reset existing records on deploy."""
     with db_connect() as conn:
@@ -712,6 +745,18 @@ def db_initialize():
                 CREATE UNIQUE INDEX IF NOT EXISTS crescendo_one_artist_per_approved_ig
                 ON crescendo_claim_requests (instagram_account_id)
                 WHERE status = 'approved'
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crescendo_email_subscribers (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'subscribed'
+                        CHECK (status IN ('subscribed', 'unsubscribed')),
+                    consent_at TIMESTAMPTZ NOT NULL,
+                    consent_source TEXT NOT NULL DEFAULT 'website',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
             """)
             # Seed only missing records; preserve edits made by the team.
             for song in SONGS:
@@ -1106,6 +1151,52 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path == '/api/email/subscribe':
+            # Accept requests only from this site's public origins.
+            origin = self.headers.get('Origin', '').rstrip('/')
+            allowed = {
+                'https://www.crescendocoin.world',
+                'https://crescendocoin.world',
+                'https://crescendocoin-production.up.railway.app',
+            }
+            extra = os.getenv('CRESCENDO_PUBLIC_URL', '').rstrip('/')
+            if extra:
+                allowed.add(extra)
+            if origin not in allowed:
+                return self.respond({'error': 'Invalid request origin'}, 403)
+            if self.headers.get('Content-Type', '').split(';')[0].strip() != 'application/json':
+                return self.respond({'error': 'Expected JSON'}, 415)
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 1024:
+                    raise ValueError('Invalid request size')
+                data = json.loads(self.rfile.read(length).decode('utf-8'))
+                if not isinstance(data, dict):
+                    raise ValueError('Invalid request')
+                email = data.get('email', '')
+                if not isinstance(email, str):
+                    raise ValueError('Invalid email')
+                email = email.strip().lower()
+                if (len(email) > 254 or not re.fullmatch(
+                    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+",
+                    email
+                )):
+                    raise ValueError('Enter a valid email address')
+                if data.get('consent') is not True:
+                    raise ValueError('Marketing consent is required')
+                # Honeypot: bots filling invisible fields receive a neutral response.
+                if data.get('website'):
+                    return self.respond({'ok': True, 'message': 'Thanks for your interest!'})
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return self.respond({'error': str(exc) or 'Invalid request'}, 400)
+            if not email_signup_allowed(self.client_address[0]):
+                return self.respond({'error': 'Too many attempts. Please try again later.'}, 429)
+            try:
+                db_email_signup(email)
+            except Exception as exc:
+                print('[EMAIL SIGNUP] Database failure:', type(exc).__name__, flush=True)
+                return self.respond({'error': 'Signup temporarily unavailable'}, 503)
+            return self.respond({'ok': True, 'message': 'Thanks for joining the Crescendo list!'})
         if path in ('/admin/artists/save', '/admin/claims/review'):
             if not self.admin_authorized():
                 return self.admin_challenge()
