@@ -433,6 +433,26 @@
         #leaderboard,#campaigns,#for-artists { scroll-margin-top:25px; }
         @media(max-width:1000px) { .main-nav { order:3; width:100%; justify-content:center; } .hero { padding:70px 0 45px; } .hero h1 { font-size:clamp(58px,8vw,90px); } }
         @media(max-width:750px) { .wrap { padding:17px 17px 50px; } header { justify-content:center; } .hero { grid-template-columns:1fr; padding:57px 0 25px; min-height:0; } .hero h1 { font-size:clamp(57px,13vw,85px); letter-spacing:-3px; } .hero-art { min-height:200px; max-height:270px; overflow:hidden; } .hero-chart { max-width:350px; } .how-steps,.tokenomics { grid-template-columns:1fr; } .how-section { padding-top:60px; } .main-nav { gap:12px 17px; } .main-nav a { font-size:12px; } .status { display:none; } }
+
+/* Email list signup */
+
+  .crescendo-newsletter{padding:clamp(48px,7vw,110px) 24px;background:#111126;color:#f6f1e9;text-align:center}
+  .crescendo-newsletter-inner{max-width:790px;margin:auto}
+  .crescendo-newsletter-eyebrow{font:600 12px/1.4 system-ui,sans-serif;letter-spacing:.24em;color:#b6a4ed}
+  .crescendo-newsletter h2{font:normal clamp(38px,6vw,72px)/1.08 Georgia,serif;letter-spacing:-.04em;margin:14px 0 20px}
+  .crescendo-newsletter h2 em{color:#bba5f0;font-weight:normal}
+  .crescendo-newsletter-inner>p:not(.crescendo-newsletter-eyebrow){max-width:610px;margin:0 auto 28px;line-height:1.7;color:#cbc6d6}
+  .crescendo-newsletter-inputrow{display:flex;gap:10px;max-width:650px;margin:auto}
+  .crescendo-newsletter-inputrow input{flex:1;min-width:0;background:#f6f1e9;color:#171527;border:1px solid #ddd5ee;border-radius:12px;padding:17px;font:16px system-ui,sans-serif}
+  .crescendo-newsletter-inputrow button{background:#bca7f1;color:#161323;border:0;border-radius:12px;padding:15px 22px;font:700 15px system-ui,sans-serif;cursor:pointer}
+  .crescendo-newsletter-inputrow button:disabled{opacity:.6;cursor:wait}
+  .crescendo-newsletter-consent{display:flex;align-items:flex-start;gap:10px;text-align:left;max-width:650px;margin:17px auto 0;font:13px/1.5 system-ui,sans-serif;color:#d2cce0}
+  .crescendo-newsletter-consent input{margin-top:3px;accent-color:#bca7f1}
+  #crescendo-email-feedback{min-height:1.5em;color:#e1d6ff;font:14px system-ui,sans-serif}
+  .crescendo-newsletter-trap{position:absolute!important;left:-10000px!important;width:1px!important;height:1px!important;opacity:0!important}
+  .crescendo-newsletter .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  @media(max-width:600px){.crescendo-newsletter-inputrow{flex-direction:column}.crescendo-newsletter-inputrow button{width:100%}}
+
     </style>
 
     <script src="/crescendo_campaigns_addon.js" defer></script>
@@ -447,7 +467,7 @@
                 <span>crescendo<small>coin</small></span>
             </a>
             <nav class="main-nav" aria-label="Main navigation">
-                <a href="#leaderboard">Leaderboard</a><a href="#how-it-works">How It Works</a><a href="#campaigns">Campaigns</a><a href="#my-rewards">My Rewards</a><a href="#for-artists" class="nav-cta">For Artists ↗</a>
+                <a href="#leaderboard">Leaderboard</a><a href="#how-it-works">How It Works</a><a href="#campaigns">Campaigns</a><a href="#my-rewards">My Rewards</a><a href="#join-crescendo">Join the List</a><a href="#for-artists" class="nav-cta">For Artists ↗</a>
             </nav>
             <span class="status" id="status">Connecting to data</span>
         </header>
@@ -539,6 +559,23 @@
             </section>
         </div>
         <div id="campaigns" aria-label="Campaigns section"></div>
+        <section id="join-crescendo" class="crescendo-newsletter" aria-labelledby="newsletter-title">
+  <div class="crescendo-newsletter-inner">
+    <p class="crescendo-newsletter-eyebrow">STAY IN THE LOOP</p>
+    <h2 id="newsletter-title">Be Part of the <em>Crescendo.</em></h2>
+    <p>Discover rising artists, follow the leaderboard, and be first to hear about our launch, new features, and community events.</p>
+    <form id="crescendo-email-form">
+      <div class="crescendo-newsletter-inputrow">
+        <label class="sr-only" for="crescendo-email">Email address</label>
+        <input id="crescendo-email" type="email" name="email" placeholder="Your email address" autocomplete="email" maxlength="254" required>
+        <button type="submit">Join the Movement <span aria-hidden="true">↗</span></button>
+      </div>
+      <label class="crescendo-newsletter-consent"><input id="crescendo-consent" type="checkbox" required> I agree to receive occasional Crescendo emails about artists, product news and launch updates.</label>
+      <input class="crescendo-newsletter-trap" type="text" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
+      <p id="crescendo-email-feedback" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+</section>
         <footer><span>© Crescendo Coin · Music in Motion</span><span>Prototype platform · No live token rewards or distributions</span></footer>
     </div>
     <script>
@@ -548,14 +585,15 @@
         // account is NOT proof of identity until the server approves the mapping.
         function claimMarkup(a) {
             const state = String(a.verification_status || a.claim_status || '').toLowerCase();
-            const verified = a.artist_verified === true && a.public_badge === true;
+            const verified = a.artistVerified === true || (a.artist_verified === true && a.public_badge === true);
             if (verified) return '<span class="claim-status verified" title="Artist identity approved">✓ Verified</span>';
             if (state === 'pending' || state === 'pending_review') return '<span class="claim-status">⏳ Pending review</span>';
             if (state === 'test_claimed') return '<span class="claim-status">✓ Test claimed</span>';
             // The backend must validate the requested artist against its DB and
             // securely bind it to the OAuth state before approving any claim.
-            const key = String(a.artistUuid || a.artist_id || a.artist || '');
-            const url = '/artist/verify?artist=' + encodeURIComponent(key);
+            const key = Number(a.artistId || a.artist_id || 0);
+            if (!Number.isSafeInteger(key) || key <= 0) return '<span class="claim-note">Claim coming soon</span>';
+            const url = '/artist/claim?artist_id=' + encodeURIComponent(key);
             return `<a class="claim-button" href="${esc(url)}" aria-label="Claim ${esc(a.artist)} profile with Instagram">◎ Claim profile</a>`;
         }
         async function load() {
@@ -599,6 +637,36 @@
             } finally { refresh.disabled = false; }
         }
         load();
+
+(function(){
+  const form=document.getElementById('crescendo-email-form');
+  const feedback=document.getElementById('crescendo-email-feedback');
+  if(!form)return;
+  form.addEventListener('submit',async function(event){
+    event.preventDefault();
+    const button=form.querySelector('button[type="submit"]');
+    button.disabled=true;
+    feedback.textContent='Joining…';
+    try{
+      const response=await fetch('/api/email/subscribe',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        credentials:'same-origin',
+        body:JSON.stringify({
+          email:document.getElementById('crescendo-email').value,
+          consent:document.getElementById('crescendo-consent').checked,
+          website:form.elements.website.value
+        })
+      });
+      const result=await response.json();
+      if(!response.ok)throw new Error(result.error||'Could not join right now.');
+      feedback.textContent=result.message||'Thanks for joining!';
+      form.reset();
+    }catch(error){feedback.textContent=error.message||'Please try again.';}
+    finally{button.disabled=false;}
+  });
+})();
+
     </script>
 </body>
 
